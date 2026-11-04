@@ -1,6 +1,6 @@
 # ArcadiaOS architecture
 
-ArcadiaOS is the coordinator: it turns Earth's goal into work for a crew of robots and keeps that work on track. This document describes the v1 core delivered in roadmap weeks 3–4 (world model, capability registry, planner, allocation, scheduling, energy policy and executor), the week-5 additions (fault response, predictive maintenance and energy-aware scheduling) and the week-6 additions: the authority layer, Earth messages, blackout behaviour and coverage-aware planning.
+ArcadiaOS is the coordinator: it turns Earth's goal into work for a crew of robots and keeps that work on track. This document describes the v1 core delivered in roadmap weeks 3–4 (world model, capability registry, planner, allocation, scheduling, energy policy and executor), the week-5 additions (fault response, predictive maintenance and energy-aware scheduling), the week-6 additions (the authority layer, Earth messages, blackout behaviour and coverage-aware planning) and the week-9 tuning of allocation against the benchmark's baselines.
 
 ## Principles
 
@@ -144,6 +144,7 @@ score = travel time
 ```
 
 - `u` is the robot's utilisation in the capacity plan. The bottleneck (u ≈ 1) mostly minimises its own travel, which matters most for slow robots doing long work. Robots with slack follow the sweep so the bottleneck finds contiguous ready cells ahead of it.
+- **Feeding steps count as roles.** A robot also counts as having a role for the pad step just before one of its roles, on the same cell: digging feeds grading, grading feeds compaction, and compaction feeds sintering. The capacity plan's split is a vertex of its linear program, so among identical robots it gives a fast feeding step such as compaction to one of them. Without this rule the other sinterers chased that robot's moving front: on ArcadiaBench Large they drove about four cells before every sinter. With it, a sinterer compacts the next cell and sinters it close by.
 - Bids the battery cannot afford are dropped.
 - Each robot first ranks its tasks by a cheap lower bound (direct travel plus the same priority terms) and fully plans only the best few, which keeps decisions fast for large crews.
 - Bids are then awarded greedily, lowest score first. Ties go to the lower robot index and then the lower task key. Robots, tasks and cells already taken are skipped, and only one ground-changing command runs on a cell at a time.
@@ -346,12 +347,28 @@ ArcadiaOS never issues a command that would complete instantly, such as a move t
 
 ## Testing
 
-- **Unit tests next to each module:** geometry, site knowledge, registry and performance factors, simplex, capacity plan, planner (including berm borrow cells), material ledger, energy, allocator (including covered scan entries and costed stranding), executor, health (smoothing, wear, calibration, the maintenance rule), power (forecast, deferral, surplus, cold window), recovery (every step, donors and the authority hooks), authority (the level-3 rule, approvals, fallbacks and vetoes, notifies, status reports) and coverage (transitive relays, scan areas).
+- **Unit tests next to each module:** geometry, site knowledge, registry and performance factors, simplex, capacity plan, planner (including berm borrow cells), material ledger, energy, allocator (including covered scan entries, costed stranding and feeding steps), executor, health (smoothing, wear, calibration, the maintenance rule), power (forecast, deferral, surplus, cold window), recovery (every step, donors and the authority hooks), authority (the level-3 rule, approvals, fallbacks and vetoes, notifies, status reports) and coverage (transitive relays, scan areas).
 - **Coordinator tests:** tow to the depot then service in place, charge in place at a station, a mobile charger for an offline robot, repair of a stuck and failed robot, parking charged before the night, a mobile charger driving to a slow robot, lost robots never commanded, a level-2 tow notified in the same decision, a policy update applied on arrival, cannibalizing asked about and done on approval (and not on a veto), the fallback deciding at once in a blackout (and nothing done at level 4), robots out of contact never commanded, and a relay stationed for work beyond coverage.
 - **`tests/crews.rs`:** synthetic scenarios on a small deterministic simulator written from the interface semantics. It covers crews of 3, 4, 5, 10 and 20 robots, generalists, mixed and overlapping capability sets, several stations, fifth-size batteries and a crew with no hauler. A mobile charger beats a weak, distant station, and a robot stranded too far from any charger is rescued by one. It also checks determinism and the per-decision time.
 - **`tests/robustness.rs`:** hostile rejections, malformed but valid goals, unknown robots and commands, no stations and immobile robots.
 - **`tests/session.rs`:** the real binary over stdio. It covers the handshake, version errors, planning once the goal arrives, back-off after a rejection, and silence by default.
 - **`tests/bench.rs`:** the real binary under ArcadiaBench (`nominal` and `conjunction` variants), when `ARCADIABENCH` is set. Seeds 1–3 of each must finish `goals_complete` with no robot lost, no policy violation, no `approval_required` or `out_of_coverage` rejection and at least one status report (metrics are read from `run_end`), and the same seed twice must give byte-identical logs.
+
+## Results (ArcadiaBench week 9, the full catalog)
+
+ArcadiaBench week 9 added the random, greedy and first-come-first-served baselines and benchmarked them with ArcadiaOS on every preset and variant, seeds 1–50, in release; its `results/v1.0/RESULTS.md` has every scorecard. Week 9 also moved the dust storm and the conjunction blackout to the first 0.03 sol, so they overlap every preset's build. Headline (success rate × mean speed), nominal variant:
+
+| Coordinator | Small | Medium | Large |
+|---|---|---|---|
+| ArcadiaOS | **0.559** | **0.753** | **0.710** |
+| greedy baseline | 0.501 | 0.681 | 0.585 |
+| random baseline | 0.499 | 0.677 | 0.587 |
+| first-come-first-served baseline | 0.385 | 0.419 | 0.362 |
+
+- ArcadiaOS completed all 900 of its runs, as did every baseline, with no policy violation and no robot lost, and has the best headline in all 18 scenarios: 10–21% above greedy's. On the nominal build it finishes the pad 15% faster than greedy, averaged over the presets, with no more Earth interventions: neither asks Earth for anything. Across the catalog it asked twice in 900 runs, both to cannibalize a robot in Large `cascading_faults`.
+- Suite resilience is 0.975, against greedy's 0.967. Greedy keeps slightly more of its own nominal headline on Medium (0.980 against 0.976) and Large (0.990 against 0.987): a fault costs both about the same time, and that is a larger share of ArcadiaOS's shorter build.
+- The feeding-step rule above is the week-9 change. Against the same simulator on seeds 1–20, it raised the Large nominal headline from 0.651 to 0.706 and Medium's from 0.736 to 0.750; Small, with one compactor-sinterer, was unchanged. No run failed before or after the change.
+- On Small the build is bound by the single compactor-sinterer, which needs about 26 kWh for the pad, three times its battery, so about six hours of a 0.81-sol build go on charging.
 
 ## Results (ArcadiaBench week 6, `landing-pad-small`)
 

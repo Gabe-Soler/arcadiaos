@@ -29,6 +29,15 @@ Robots are described only by their capabilities, so roles emerge from allocation
 
 ## Status
 
+**Week 9: benchmarked against the baselines.** ArcadiaBench now ships random, greedy and first-come-first-served baseline coordinators and its first results, on every preset and variant over seeds 1–50 ([ArcadiaBench `results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/ArcadiaBench/blob/main/results/v1.0/RESULTS.md)). ArcadiaOS completes every run and has the best headline (success rate × speed) in all 18 scenarios:
+
+| Nominal headline | Small (4 robots) | Medium (10) | Large (20) |
+|---|---|---|---|
+| ArcadiaOS | **0.559** | **0.753** | **0.710** |
+| greedy baseline | 0.501 | 0.681 | 0.585 |
+
+On the nominal build ArcadiaOS finishes the pad 15% faster than greedy, averaged over the presets, with no more Earth interventions: neither asks Earth for anything. Week 9's one change to ArcadiaOS lets a compactor-sinterer compact the cells it is about to sinter, which cut its sinterers' driving on Large and raised that headline from 0.651 to 0.706 ([architecture](docs/architecture.md#dispatch-sequential-auction)).
+
 **Week 6: authority, Earth in the loop, blackouts and coverage.** On the ArcadiaBench week-6 simulator (`landing-pad-small`, four robots; faults and wear, the Earth link with light-time delay and outages, authority enforcement and site coverage), every run tested builds and verifies the pad within the policy:
 
 | Variant | Completed | Sols (mean, min–max) | Policy violations | Messages to Earth (notifies, status reports) |
