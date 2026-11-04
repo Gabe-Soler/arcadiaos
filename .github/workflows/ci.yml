@@ -7,17 +7,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # ArcadiaBench revision the integration job runs against: pinned to the
-  # week-6 simulator (the Earth link with light-time delay, outages and the
-  # conjunction blackout; authority enforcement; site coverage and relays;
-  # protocol v0.2.0) that this coordinator speaks. The integration tests run
-  # the `nominal` and `conjunction` variants.
-  BENCH_REF: 7c41a9210d66496e7f8b6f7b9045a3775c3a112e
+  # ArcadiaBench 1.0.0 release commit, which speaks arcadia-protocol 1.0.0
+  # like this coordinator. The integration tests run the `nominal` and
+  # `conjunction` variants.
+  BENCH_REF: f00874d72b59431b62f627639bd79d388d930a1b
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -25,13 +24,16 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   bench-integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Check out ArcadiaBench
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: Gabe-Soler/ArcadiaBench
           ref: ${{ env.BENCH_REF }}

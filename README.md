@@ -4,6 +4,8 @@ ArcadiaOS: an operating system for robot crews building on Mars.
 
 ArcadiaOS decides which robot does what, when, and with how much power, while Earth supervises across a 4–24 minute delay and multi-week blackouts. It is measured on [ArcadiaBench](https://github.com/Gabe-Soler/ArcadiaBench), and it talks to the world only through [arcadia-protocol](https://github.com/Gabe-Soler/arcadia-protocol). That means the same coordinator can drive the simulator now and real hardware later.
 
+**Version 1.0.0**, speaking arcadia-protocol 1.0.0. It builds the landing pad of every ArcadiaBench 1.0 scenario, with any of the benchmark's crews, and has the best headline score in all 18 ([results](#results)).
+
 ## What it does
 
 ArcadiaOS turns Earth's landing-pad goal into work for the whole crew. It uses only what it is told in `hello` and in observations: never ground truth.
@@ -27,69 +29,57 @@ ArcadiaOS turns Earth's landing-pad goal into work for the whole crew. It uses o
 
 Robots are described only by their capabilities, so roles emerge from allocation and any crew works. See [docs/architecture.md](docs/architecture.md) for the design.
 
-## Status
+## Run it under ArcadiaBench
 
-**Week 9: benchmarked against the baselines.** ArcadiaBench now ships random, greedy and first-come-first-served baseline coordinators and its first results, on every preset and variant over seeds 1–50 ([ArcadiaBench `results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/ArcadiaBench/blob/main/results/v1.0/RESULTS.md)). ArcadiaOS completes every run and has the best headline (success rate × speed) in all 18 scenarios:
+ArcadiaOS is a coordinator process that speaks newline-delimited JSON on stdin/stdout; a simulator launches it. With Rust (stable) installed and [ArcadiaBench](https://github.com/Gabe-Soler/ArcadiaBench) checked out beside this repository, from this repository's root:
+
+```sh
+cargo build --release
+(cd ../ArcadiaBench && cargo build --release)
+
+# One run: Small crew, nominal conditions, seed 1, with its event log.
+../ArcadiaBench/target/release/arcadiabench run --seed 1 --log run.jsonl -- ./target/release/arcadiaos
+
+# Ten seeds of the Medium crew through a conjunction blackout, scored.
+../ArcadiaBench/target/release/arcadiabench bench --preset medium --variant conjunction --seeds 1-10 --out runs/medium-conjunction -- ./target/release/arcadiaos
+```
+
+Each run prints a one-line summary, and `bench` prints its scorecard. ArcadiaBench's README covers every preset, variant and command, its replay viewer opens any saved log, and its `scripts/results.sh` reproduces the full benchmark results with this binary (it looks for it at `../arcadiaos/target/release/arcadiaos`, or wherever `ARCADIAOS` says).
+
+ArcadiaOS writes nothing to stderr by default. Set `ARCADIAOS_LOG=info` for plan summaries, the capacity plan, charging, faults, recoveries and maintenance (with each robot's estimated wear at the end), or `ARCADIAOS_LOG=debug` to see every command as well.
+
+## Results
+
+On ArcadiaBench 1.0 ([`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/ArcadiaBench/blob/v1.0.0/results/v1.0/RESULTS.md)), every preset and variant over seeds 1–50, ArcadiaOS completes all 900 of its runs, with no policy violation and no robot lost, and has the best headline (success rate × speed) in all 18 scenarios, 10–21% above the greedy baseline's:
 
 | Nominal headline | Small (4 robots) | Medium (10) | Large (20) |
 |---|---|---|---|
 | ArcadiaOS | **0.559** | **0.753** | **0.710** |
 | greedy baseline | 0.501 | 0.681 | 0.585 |
+| random baseline | 0.499 | 0.677 | 0.587 |
+| first-come-first-served baseline | 0.385 | 0.419 | 0.362 |
 
-On the nominal build ArcadiaOS finishes the pad 15% faster than greedy, averaged over the presets, with no more Earth interventions: neither asks Earth for anything. Week 9's one change to ArcadiaOS lets a compactor-sinterer compact the cells it is about to sinter, which cut its sinterers' driving on Large and raised that headline from 0.651 to 0.706 ([architecture](docs/architecture.md#dispatch-sequential-auction)).
+- On the nominal build it finishes the pad 15% faster than greedy, averaged over the presets, and neither needs Earth there. Across the whole catalog it asked Earth twice in 900 runs, both to cannibalize a robot in Large `cascading_faults`.
+- Its suite resilience is 0.975, against greedy's 0.967.
+- Decisions take a fraction of a millisecond, and runs on the same seed are byte-identical.
 
-**Week 6: authority, Earth in the loop, blackouts and coverage.** On the ArcadiaBench week-6 simulator (`landing-pad-small`, four robots; faults and wear, the Earth link with light-time delay and outages, authority enforcement and site coverage), every run tested builds and verifies the pad within the policy:
-
-| Variant | Completed | Sols (mean, min–max) | Policy violations | Messages to Earth (notifies, status reports) |
-|---|---|---|---|---|
-| `nominal`, seeds 1–20 | 20 / 20 | 0.806, 0.788–0.880 | 0 | 34 (14, 20) |
-| `conjunction`, seeds 1–20 | 20 / 20 | 0.806, 0.788–0.880 | 0 | 34 (14, 20) |
-| `cascading_faults`, seeds 1–20 | 20 / 20 | 0.876, 0.856–0.944 | 0 | 91 (71, 20) |
-| `solar_only`, seeds 1–10 | 10 / 10 | 0.799, 0.792–0.807 | 0 | 14 (4, 10) |
-| `nuclear_heavy`, seeds 1–10 | 10 / 10 | 0.799, 0.788–0.808 | 0 | 14 (4, 10) |
-
-- No command is rejected (no `approval_required`, `vetoed` or `out_of_coverage`), no robot is lost, and runs are byte-identical across repeats.
-- No robot leaves the base station's coverage (bar one 3 s clip in 20 `cascading_faults` runs), where week 5's coordinator lost hours of robot time a run to lost-link returns.
-- No run needs an approval: the default policy asks for none of what this crew does, and no robot in it is redundant enough to be a donor.
-
-**Week 5: fault response, predictive maintenance and energy-aware scheduling.** On the ArcadiaBench week-5 simulator, every run tested built and verified the pad:
-
-| Variant | Completed | Sols (mean, min–max) | Robot-hours lost (mean) |
-|---|---|---|---|
-| `nominal`, seeds 1–20 | 20 / 20 | 0.811, 0.791–0.881 | 0.23 |
-| `cascading_faults`, seeds 1–20 | 20 / 20 | 0.875, 0.840–0.965 | 0.70 |
-| `solar_only`, seeds 1–10 | 10 / 10 | 0.807, 0.792–0.873 | 0.21 |
-| `nuclear_heavy`, seeds 1–10 | 10 / 10 | 0.806, 0.791–0.872 | 0.21 |
-
-- No command was rejected and no robot was lost.
-- Decisions took about 0.02 ms on average, and runs with the same seed produced byte-identical logs.
-- The week 3–4 core managed 18 of 20 `nominal` and 3 of 20 `cascading_faults` seeds on the same simulator.
-
-**Weeks 3–4: core coordinator.** On the week-2 simulator, seeds 1–20 finished in 0.774 sols on average (0.765–0.783), against about 1.6 sols for the naive scripted builder. On synthetic scenarios ArcadiaOS also handles crews of 3 to 20 robots with overlapping capability sets, several stations, small batteries, mobile charging and rescue, and a crew with no hauler.
-
-## Run
-
-ArcadiaOS is a coordinator process that speaks newline-delimited JSON on stdin/stdout. A simulator launches it, for example:
-
-```sh
-cargo build --release
-arcadiabench run --seed 1 --variant nominal --log run.jsonl -- ./target/release/arcadiaos
-```
-
-It writes nothing to stderr by default. Set `ARCADIAOS_LOG=info` for plan summaries, the capacity plan, charging, faults, recoveries and maintenance (with each robot's estimated wear at the end), or `ARCADIAOS_LOG=debug` to see every command as well.
+ArcadiaBench's [demo replays](https://github.com/Gabe-Soler/ArcadiaBench/blob/v1.0.0/docs/demos.md) show ArcadiaOS through a nominal build, a dust storm, a conjunction blackout and cascading faults. [docs/architecture.md](docs/architecture.md#results) discusses where the time goes.
 
 ## Develop
 
 ```sh
-cargo test     # unit tests, synthetic crews of 4–20 robots, and the real binary over stdio
+cargo test     # unit tests, synthetic crews of 3–20 robots, and the real binary over stdio
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
 # End to end against ArcadiaBench (skipped unless ARCADIABENCH is set):
-ARCADIABENCH=/path/to/arcadiabench cargo test --release --test bench
+ARCADIABENCH=../ArcadiaBench/target/release/arcadiabench cargo test --release --test bench
 ```
 
 CI runs the checks above. A separate job builds ArcadiaBench at the commit pinned in `BENCH_REF` and runs the end-to-end tests (the `nominal` and `conjunction` variants) against it.
+
+[docs/architecture.md](docs/architecture.md) describes the design, and [CHANGELOG.md](CHANGELOG.md) what each release contains.
 
 ## License
 

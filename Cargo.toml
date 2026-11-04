@@ -1,6 +1,6 @@
 [package]
 name = "arcadiaos"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "An operating system for robot crews building on Mars."
 license = "MIT"
@@ -8,4 +8,4 @@ repository = "https://github.com/Gabe-Soler/arcadiaos"
 
 [dependencies]
 # ArcadiaOS talks to the world only through the shared spec.
-arcadia-protocol = { git = "https://github.com/Gabe-Soler/arcadia-protocol", tag = "v0.2.0" }
+arcadia-protocol = { git = "https://github.com/Gabe-Soler/arcadia-protocol", tag = "v1.0.0" }
