@@ -427,3 +427,64 @@ fn scans_start_inside_coverage_and_work_out_of_it_is_costed() {
     );
     assert_eq!(r.awards[0].task, 1);
 }
+
+fn compactor_sinterer(id: &str) -> RobotSpec {
+    robot(
+        id,
+        0.15,
+        vec![
+            cap(CapabilityName::Compact, 0.1, 4.0, None),
+            cap(CapabilityName::Sinter, 0.01, 60.0, None),
+        ],
+    )
+}
+
+#[test]
+fn a_sinterer_compacts_the_cells_it_will_sinter() {
+    assert_eq!(feeds(CapabilityName::Dig), Some(CapabilityName::Grade));
+    assert_eq!(feeds(CapabilityName::Compact), Some(CapabilityName::Sinter));
+    assert_eq!(feeds(CapabilityName::Sinter), None);
+    assert_eq!(feeds(CapabilityName::Haul), None);
+    let mut f = Fixture::new(
+        vec![compactor_sinterer("a"), compactor_sinterer("b")],
+        vec![
+            state("a", 4, 3, 9000.0, 0.0),
+            state("b", 11, 3, 9000.0, 0.0),
+        ],
+        Config::default(),
+    );
+    // The whole pad graded: compaction, then sintering, remain.
+    let graded: Vec<CellObservation> = f
+        .planner
+        .order()
+        .iter()
+        .map(|&at| CellObservation {
+            at,
+            cell: Cell {
+                elevation_m: Some(TARGET),
+                surface: Some(Surface::Graded),
+                boulders: Some(vec![]),
+                ..Cell::default()
+            },
+        })
+        .collect();
+    f.world.site.apply_scan(&graded, 0.0, 1.0);
+    f.plan_capacity();
+    for r in 0..2 {
+        assert!(f.capacity.is_role(r, CapabilityName::Sinter, 0.05), "{r}");
+    }
+    let tasks = f.planner.tasks(&f.world, &Busy::default(), &f.cfg);
+    let compacts: Vec<Task> = tasks
+        .iter()
+        .filter(|t| t.stage == Stage::Compact)
+        .cloned()
+        .collect();
+    assert!(!compacts.is_empty());
+    // Each sinterer compacts without the help penalty, whatever the
+    // capacity plan made of compaction itself.
+    for r in 0..2 {
+        let result = f.auction(&[r], &compacts, &Busy::default(), &BTreeMap::new());
+        assert_eq!(result.awards.len(), 1, "{r}");
+        assert!(result.awards[0].score < f.cfg.help_penalty_s, "{r}");
+    }
+}
