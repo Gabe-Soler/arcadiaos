@@ -6,6 +6,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # ArcadiaBench revision the integration job runs against: pinned to the
+  # week-2 simulator (protocol v0.1.0) that this coordinator speaks.
+  BENCH_REF: ffa8a66f0622d7e78e80de256c4cef07acf3a8b0
 
 jobs:
   check:
@@ -19,3 +22,26 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+
+  bench-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check out ArcadiaBench
+        uses: actions/checkout@v5
+        with:
+          repository: Gabe-Soler/ArcadiaBench
+          ref: ${{ env.BENCH_REF }}
+          path: bench
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            bench -> target
+      - name: Build ArcadiaBench
+        run: cargo build --release --manifest-path bench/Cargo.toml
+      - name: Build ArcadiaOS
+        run: cargo build --release
+      - name: Run ArcadiaOS under ArcadiaBench
+        run: ARCADIABENCH="$GITHUB_WORKSPACE/bench/target/release/arcadiabench" cargo test --release --test bench
