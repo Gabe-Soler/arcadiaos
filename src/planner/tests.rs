@@ -397,3 +397,83 @@ fn refused_grades_tighten_the_window_for_that_cell() {
     );
     assert!(p.cell_status(&w, c, &cfg).dig, "cut first after a refusal");
 }
+
+#[test]
+fn a_berm_out_of_coverage_is_built_from_covered_borrow_cells() {
+    let cfg = Config::default();
+    let berm = vec![GridCoord { x: 3, y: 9 }, GridCoord { x: 4, y: 9 }];
+    let mut sc = scenario(vec![robot(
+        "ex",
+        0.2,
+        vec![
+            cap(CapabilityName::Dig, 0.01, 50.0, None),
+            cap(CapabilityName::Haul, 2.0, 0.01, Some(250.0)),
+            cap(CapabilityName::Scan, 4.0, 0.05, None),
+        ],
+    )]);
+    sc.site.cell_size_m = 1.0;
+    // The base station reaches row 7 of the pad's column, not the berm on row 9.
+    sc.base_station = BaseStation {
+        position: GridCoord { x: 3, y: 0 },
+        range_m: 7.5,
+    };
+    let mut w = WorldModel::new(&sc);
+    w.fleet.update(&[state("ex", 0, 0)]);
+    let reg = Registry::new(&sc);
+    let mut p = Planner::new("g", &pad_spec(berm.clone()), &w, &reg, &cfg);
+    let at = |x, y| GridCoord { x, y };
+    assert_eq!(p.borrow[0].map(|b| b.at), Some(at(3, 7)));
+    assert_eq!(p.borrow[1].map(|b| b.at), Some(at(4, 7)));
+    let cov = crate::coverage::Coverage::new(&w.base_station, 1.0, &[]);
+    for pile in &p.material.piles {
+        assert!(cov.covers(pile.at), "pile at {:?}", pile.at);
+        assert!(pile.at != at(3, 7) && pile.at != at(4, 7));
+    }
+
+    let scan: Vec<CellObservation> = berm
+        .iter()
+        .chain([at(3, 7), at(4, 7)].iter())
+        .map(|&c| observe(c, -9.5, Surface::Natural, false))
+        .collect();
+    w.site.apply_scan(&scan, 0.0, 1.0);
+    p.after_scan(&w, &scan, &cfg);
+    let tasks = p.tasks(&w, &Busy::default(), &cfg);
+    assert!(
+        !tasks.iter().any(|t| t.stage == Stage::Berm),
+        "no hauls out of coverage"
+    );
+    let dig = tasks
+        .iter()
+        .find(|t| t.key == TaskKey::Cell(Stage::Dig, 3, 7))
+        .expect("a borrow dig");
+    assert_eq!(dig.cast_to, Some(at(3, 9)));
+    // Deep enough for the berm's need even if the payload takes the first 250 kg.
+    let need = p.berm_need_kg(&w, 0, &cfg);
+    let spoil = w.site.dig_spoil_kg(at(3, 7), dig.elevation_m, &cfg);
+    assert!((spoil - (need + 250.0)).abs() < 1e-6, "{spoil} vs {need}");
+    // The dig and its spoil feed the berm; the workload counts it as digging.
+    let wl = p.workload(&w, &reg, &cfg);
+    assert!(wl.get(&CapabilityName::Dig).is_some_and(|d| d.steps >= 2.0));
+    w.site.record_dig(at(3, 7), dig.elevation_m, 2.0, &cfg);
+    w.site
+        .record_deposit(at(3, 9), spoil - 250.0, true, 2.0, &cfg);
+    p.record_berm_deposit(0, spoil - 250.0);
+    assert!(p.berm_need_kg(&w, 0, &cfg) < cfg.min_haul_kg);
+    // A dug-out borrow cell hands the berm back to hauling.
+    w.site.apply_scan(
+        &[observe(
+            at(4, 7),
+            p.borrow[1].unwrap().floor_m.unwrap(),
+            Surface::Cleared,
+            false,
+        )],
+        3.0,
+        4.0,
+    );
+    let tasks = p.tasks(&w, &Busy::default(), &cfg);
+    assert!(
+        tasks
+            .iter()
+            .any(|t| t.stage == Stage::Berm && t.cell() == at(4, 9))
+    );
+}

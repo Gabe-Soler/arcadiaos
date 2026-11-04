@@ -102,6 +102,11 @@ impl Fixture {
         busy: &Busy,
         crowd: &BTreeMap<(CapabilityName, usize), usize>,
     ) -> AuctionResult {
+        let coverage = crate::coverage::Coverage::new(
+            &self.world.base_station,
+            self.world.site.cell_size_m,
+            &[],
+        );
         let ctx = Context {
             world: &self.world,
             reg: &self.reg,
@@ -110,6 +115,7 @@ impl Fixture {
             cfg: &self.cfg,
             busy,
             crowd,
+            coverage: &coverage,
         };
         let bidders: Vec<Bidder> = robots
             .iter()
@@ -297,6 +303,8 @@ fn hauls_use_payload_on_board_and_respect_overfill() {
     f.plan_capacity();
     let tasks = f.planner.tasks(&f.world, &Busy::default(), &f.cfg);
     let fill = tasks.iter().find(|t| t.stage == Stage::Fill).unwrap();
+    let coverage =
+        crate::coverage::Coverage::new(&f.world.base_station, f.world.site.cell_size_m, &[]);
     let ctx = Context {
         world: &f.world,
         reg: &f.reg,
@@ -305,6 +313,7 @@ fn hauls_use_payload_on_board_and_respect_overfill() {
         cfg: &f.cfg,
         busy: &Busy::default(),
         crowd: &BTreeMap::new(),
+        coverage: &coverage,
     };
     // 380 kg on board covers the 375 kg the cell wants: dump without loading.
     let plan = plan_work(&ctx, 0, fill).unwrap();
@@ -337,4 +346,84 @@ fn crowding_spreads_robots_across_sections() {
     crowd.insert((CapabilityName::Dig, first_section.unwrap()), 2);
     let spread = f.auction(&[0], &tasks, &Busy::default(), &crowd);
     assert_ne!(tasks[spread.awards[0].task].section, first_section);
+}
+
+#[test]
+fn scans_start_inside_coverage_and_work_out_of_it_is_costed() {
+    let scout = robot("sc", 0.5, vec![cap(CapabilityName::Scan, 4.0, 0.05, None)]);
+    let digger = robot("ex", 0.2, vec![cap(CapabilityName::Dig, 0.01, 50.0, None)]);
+    let mut f = Fixture::new(
+        vec![scout, digger],
+        vec![
+            state("sc", 6, 1, 1400.0, 0.0),
+            state("ex", 6, 2, 5000.0, 0.0),
+        ],
+        Config::default(),
+    );
+    // The base station covers the south of the pad but not its north rows.
+    f.world.base_station = BaseStation {
+        position: GridCoord { x: 6, y: 0 },
+        range_m: 9.0,
+    };
+    let coverage = crate::coverage::Coverage::new(&f.world.base_station, 1.0, &[]);
+    f.plan_capacity();
+    let ctx = Context {
+        world: &f.world,
+        reg: &f.reg,
+        planner: &f.planner,
+        capacity: &f.capacity,
+        cfg: &f.cfg,
+        busy: &Busy::default(),
+        crowd: &BTreeMap::new(),
+        coverage: &coverage,
+    };
+    // A scan of the uncovered north rows grows south until its entry is covered.
+    let north = GridRect {
+        min: GridCoord { x: 4, y: 10 },
+        max: GridCoord { x: 11, y: 11 },
+    };
+    let scan = Task {
+        key: TaskKey::Verify,
+        stage: Stage::Verify,
+        area: north,
+        seq: 0.0,
+        amount: geom::cell_count(&north) as f64,
+        max_kg: 0.0,
+        elevation_m: 0.0,
+        section: None,
+        cast_to: None,
+    };
+    let plan = plan_work(&ctx, 0, &scan).unwrap();
+    let Action::Scan { area } = plan.action else {
+        panic!("{:?}", plan.action)
+    };
+    assert!(area.min.y < 10 && area.max == north.max, "{area:?}");
+    assert!(coverage.covers(plan.end) && !plan.strands);
+    // Digging an uncovered cell strands the digger: the lost-link wait is part of the plan.
+    let dig = |x, y| Task {
+        key: TaskKey::Cell(Stage::Dig, x, y),
+        stage: Stage::Dig,
+        area: geom::unit(GridCoord { x, y }),
+        seq: 0.0,
+        amount: 0.1,
+        max_kg: 0.0,
+        elevation_m: TARGET,
+        section: None,
+        cast_to: None,
+    };
+    let near = plan_work(&ctx, 1, &dig(6, 5)).unwrap();
+    let far = plan_work(&ctx, 1, &dig(6, 11)).unwrap();
+    assert!(!near.strands && far.strands);
+    assert!(far.duration_s >= near.duration_s + f.cfg.lost_link_timeout_s);
+    // In an auction the covered dig wins even though the other is no further.
+    let r = auction(
+        &ctx,
+        &[Bidder {
+            robot: 1,
+            roles_only: false,
+        }],
+        &[dig(6, 11), dig(6, 5)],
+        &|_, _| false,
+    );
+    assert_eq!(r.awards[0].task, 1);
 }

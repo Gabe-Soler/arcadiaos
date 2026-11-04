@@ -201,6 +201,39 @@ pub struct Config {
     pub bank_surplus_frac: f64,
     /// Battery fraction below which a free robot tops up in a surplus window.
     pub surplus_charge_frac: f64,
+
+    // ----- Earth, authority and coverage -----
+    /// One-way light time assumed before the first `comms` report, s.
+    pub assumed_delay_s: f64,
+    /// Mission control's typical response time to an approval request, s
+    /// (interface assumption).
+    pub earth_response_s: f64,
+    /// An approval is waited for this multiple of the expected round trip.
+    pub answer_margin: f64,
+    /// Expected cost of a cannibalization Earth would not have approved: a
+    /// robot lost for good, in seconds of crew time.
+    pub cannibalize_risk_s: f64,
+    /// A status report goes to Earth this often while the link is up, s.
+    pub status_period_s: f64,
+    /// An idle robot out of coverage this long drives back on its own, s
+    /// (interface assumption).
+    pub lost_link_timeout_s: f64,
+    /// Radio power a holding relay draws on top of idle, W (interface assumption).
+    pub relay_radio_w: f64,
+    /// Deepest a berm borrow cell is dug below its first known elevation, m.
+    pub berm_borrow_max_depth_m: f64,
+    /// A relay is stationed when the robot time it saves is at least this
+    /// multiple of what it costs the relay robot.
+    pub relay_benefit_ratio: f64,
+    /// A robot out of contact this long past its expected return is presumed
+    /// stranded, s.
+    pub stranded_margin_s: f64,
+    /// What cannibalizing gains when nothing else can bring the robot back:
+    /// its work for the rest of the mission, taken as a sol, s.
+    pub no_alternative_s: f64,
+    /// What a standing approval of a routine action is worth, for the
+    /// level-3 rule, s.
+    pub routine_benefit_s: f64,
 }
 
 impl Default for Config {
@@ -299,6 +332,19 @@ impl Default for Config {
             bank_floor_frac: 0.25,
             bank_surplus_frac: 0.9,
             surplus_charge_frac: 0.9,
+
+            assumed_delay_s: 720.0,
+            earth_response_s: 1200.0,
+            answer_margin: 1.5,
+            cannibalize_risk_s: 21_600.0,
+            status_period_s: 88_775.0,
+            lost_link_timeout_s: 1800.0,
+            relay_radio_w: 25.0,
+            berm_borrow_max_depth_m: 1.5,
+            relay_benefit_ratio: 1.5,
+            stranded_margin_s: 1800.0,
+            no_alternative_s: 88_775.0,
+            routine_benefit_s: 14_400.0,
         }
     }
 }

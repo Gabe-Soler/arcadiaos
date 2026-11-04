@@ -14,15 +14,20 @@
 //! - [`health`]: wear estimates from telemetry and usage, performance factors and the
 //!   predictive-maintenance rule;
 //! - [`recovery`]: getting stuck, failed and offline robots back to work;
+//! - [`authority`]: the policy in effect, approvals, the level-3 fallback
+//!   rule, notifies and status reports to Earth;
+//! - [`coverage`]: which cells the base station and relays cover;
 //! - [`executor`]: the command lifecycle, retries and cancellation;
 //! - [`coordinator`]: one decision per observation, tying the rest together.
 //!
 //! Decisions are deterministic: the same inputs always give the same commands.
 
 pub mod allocator;
+pub mod authority;
 pub mod capacity;
 pub mod config;
 pub mod coordinator;
+pub mod coverage;
 pub mod diag;
 pub mod energy;
 pub mod executor;

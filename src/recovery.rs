@@ -20,11 +20,12 @@
 //! go to the lower helper index. A helper whose battery cannot cover the step
 //! and its reserve is sent to charge first.
 //!
-//! Every option names the policy action it uses, and [`permitted`] gates it.
-//! Today that allows levels 1 and 2 (`tow` is level 2 in the default policy)
-//! and rules out level 3 (`cannibalize`). Week 6 replaces the gate with the
-//! approval flow: a level-3 option becomes an approval request, with the
-//! best permitted option as the fallback.
+//! Every option names the policy action it uses, and the coordinator's
+//! authority layer gates it through [`Ctx::may`]: levels 1 and 2 are taken
+//! (level 2 with a notify), higher levels only with an approval in hand.
+//! Cannibalizing (level 3 by default) is gated per donor by
+//! [`Ctx::may_strip`], because an approval covers the strip it asked for;
+//! [`best_cannibalize`] finds the option worth asking Earth about.
 
 use crate::config::Config;
 use crate::energy::{ChargeSource, Energy, StationLoad};
@@ -33,7 +34,7 @@ use crate::geom;
 use crate::health::Health;
 use crate::registry::Registry;
 use crate::world::WorldModel;
-use arcadia_protocol::{CapabilityName, GridCoord, Policy, RobotStatus, Surface};
+use arcadia_protocol::{CapabilityName, GridCoord, RobotStatus, Surface};
 use std::collections::BTreeSet;
 
 /// Robots within this many cells of each other can work on each other.
@@ -44,6 +45,10 @@ const FIRM_SEARCH_CELLS: i64 = 6;
 
 /// How far a stuck robot is towed towards a station when no firm cell is known, cells.
 const FREE_TOW_CELLS: f64 = 3.0;
+
+/// Work to strip a donor and fit its parts, in repair units (interface
+/// assumption: 0.5 to strip, 1.0 to install).
+const CANNIBALIZE_UNITS: f64 = 1.5;
 
 /// One step that moves a disabled robot towards working again.
 #[derive(Debug, Clone, PartialEq)]
@@ -126,12 +131,6 @@ pub struct Plan {
     pub affordable: bool,
 }
 
-/// Whether ArcadiaOS may take `action` without Earth's approval under
-/// `policy`: levels 1 (autonomous) and 2 (act, then notify).
-pub fn permitted(policy: &Policy, action: &str) -> bool {
-    policy.level_for(action).get() <= 2
-}
-
 /// Everything recovery planning reads.
 #[derive(Clone, Copy)]
 pub struct Ctx<'a> {
@@ -155,6 +154,10 @@ pub struct Ctx<'a> {
     pub engaged: &'a BTreeSet<usize>,
     /// Robots with a command in flight.
     pub running: &'a BTreeSet<usize>,
+    /// Actions ArcadiaOS may take now without asking Earth.
+    pub may: &'a dyn Fn(&str) -> bool,
+    /// Donors the robot being recovered may now be given parts from.
+    pub may_strip: &'a dyn Fn(usize) -> bool,
 }
 
 impl Ctx<'_> {
@@ -243,7 +246,7 @@ pub fn plan(ctx: &Ctx, target: usize, helpers: &[usize]) -> Option<Plan> {
     // Steps the robot can take where it stands.
     if (stuck || faulty)
         && let Some(d) = ctx.depot_at(pos)
-        && permitted(&world.policy, "service")
+        && (ctx.may)("service")
     {
         return Some(Plan {
             target,
@@ -253,7 +256,7 @@ pub fn plan(ctx: &Ctx, target: usize, helpers: &[usize]) -> Option<Plan> {
             affordable: true,
         });
     }
-    if offline && permitted(&world.policy, "charge") {
+    if offline && (ctx.may)("charge") {
         let source = ctx
             .station_at(pos)
             .map(ChargeSource::Station)
@@ -271,7 +274,11 @@ pub fn plan(ctx: &Ctx, target: usize, helpers: &[usize]) -> Option<Plan> {
 
     let mut best: Option<Plan> = None;
     let mut consider = |p: Plan| {
-        if !permitted(&world.policy, p.step.action()) {
+        let allowed = match p.step {
+            Step::Cannibalize { donor, .. } => (ctx.may_strip)(donor),
+            _ => (ctx.may)(p.step.action()),
+        };
+        if !allowed {
             return;
         }
         let better = match &best {
@@ -394,37 +401,71 @@ pub fn plan(ctx: &Ctx, target: usize, helpers: &[usize]) -> Option<Plan> {
         }
     }
 
-    // Parts from a donor, where the policy allows it without approval.
-    if faulty && permitted(&world.policy, "cannibalize") {
-        for &r in helpers {
-            if r == target || !reg.can(r, CapabilityName::Repair) {
-                continue;
-            }
-            let Some(rpos) = ctx.pos(r) else { continue };
-            for donor in donors(ctx, target, r) {
-                let Some(dpos) = ctx.pos(donor) else { continue };
-                let units = 1.5;
-                let wh = reg.travel_wh(r, rpos, dpos)
-                    + reg.travel_wh(r, dpos, pos)
-                    + reg.work_wh(r, CapabilityName::Repair, units, cfg.min_work_s);
-                let need = ctx.need(r, wh, pos);
-                let cost = reg.travel_s(r, rpos, dpos)
-                    + reg.travel_s(r, dpos, pos)
-                    + reg.work_s(r, CapabilityName::Repair, units, cfg.min_work_s)
-                    + ctx.charge_first_s(r, need);
-                if cost.is_finite() {
-                    consider(Plan {
-                        target,
-                        step: Step::Cannibalize { executor: r, donor },
-                        cost_s: cost,
-                        helper_need_wh: need,
-                        affordable: ctx.battery(r) >= need,
-                    });
-                }
-            }
+    // Parts from a donor, where the authority layer allows that donor.
+    if faulty {
+        for p in cannibalize_options(ctx, target, pos, helpers) {
+            consider(p);
         }
     }
     best
+}
+
+/// Every way of restoring failed robot `target` (at `pos`) with parts from a
+/// donor, costed like the other options.
+fn cannibalize_options(ctx: &Ctx, target: usize, pos: GridCoord, helpers: &[usize]) -> Vec<Plan> {
+    let (reg, cfg) = (ctx.reg, ctx.cfg);
+    let mut out = Vec::new();
+    for &r in helpers {
+        if r == target || !reg.can(r, CapabilityName::Repair) {
+            continue;
+        }
+        let Some(rpos) = ctx.pos(r) else { continue };
+        for donor in donors(ctx, target, r) {
+            let Some(dpos) = ctx.pos(donor) else { continue };
+            let units = CANNIBALIZE_UNITS;
+            let wh = reg.travel_wh(r, rpos, dpos)
+                + reg.travel_wh(r, dpos, pos)
+                + reg.work_wh(r, CapabilityName::Repair, units, cfg.min_work_s);
+            let need = ctx.need(r, wh, pos);
+            let cost = reg.travel_s(r, rpos, dpos)
+                + reg.travel_s(r, dpos, pos)
+                + reg.work_s(r, CapabilityName::Repair, units, cfg.min_work_s)
+                + ctx.charge_first_s(r, need);
+            if cost.is_finite() {
+                out.push(Plan {
+                    target,
+                    step: Step::Cannibalize { executor: r, donor },
+                    cost_s: cost,
+                    helper_need_wh: need,
+                    affordable: ctx.battery(r) >= need,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The cheapest cannibalization for disabled robot `target`, whether or not
+/// it is allowed yet: what ArcadiaOS would ask Earth to approve. Affordable
+/// options beat ones that need the helper to charge first.
+pub fn best_cannibalize(ctx: &Ctx, target: usize, helpers: &[usize]) -> Option<Plan> {
+    let e = ctx.world.fleet.get(target);
+    if !e.recoverable()
+        || !e.has_disabled_fault()
+        || ctx.engaged.contains(&target)
+        || ctx.running.contains(&target)
+    {
+        return None;
+    }
+    let pos = e.position()?;
+    cannibalize_options(ctx, target, pos, helpers)
+        .into_iter()
+        .min_by(|a, b| {
+            b.affordable
+                .cmp(&a.affordable)
+                .then(a.cost_s.total_cmp(&b.cost_s))
+                .then(a.step.helper().cmp(&b.step.helper()))
+        })
 }
 
 /// Robots that may be stripped to restore `target`: disabled (a disabling
@@ -617,7 +658,20 @@ mod tests {
         0.0
     }
 
-    fn ctx<'a>(w: &'a WorldModel, reg: &'a Registry, f: &'a Fixture) -> Ctx<'a> {
+    fn up_to_level_2(w: &WorldModel) -> impl Fn(&str) -> bool + '_ {
+        |action: &str| w.policy.level_for(action).get() <= 2
+    }
+
+    fn never(_: usize) -> bool {
+        false
+    }
+
+    fn ctx<'a>(
+        w: &'a WorldModel,
+        reg: &'a Registry,
+        f: &'a Fixture,
+        may: &'a dyn Fn(&str) -> bool,
+    ) -> Ctx<'a> {
         Ctx {
             world: w,
             reg,
@@ -629,6 +683,8 @@ mod tests {
             service_s: 7200.0,
             engaged: &f.engaged,
             running: &f.running,
+            may,
+            may_strip: &never,
         }
     }
 
@@ -643,13 +699,13 @@ mod tests {
             state("hauler", 40, 40, RobotStatus::Idle, 9000.0),
         ]);
         let f = Fixture::new(&reg);
-        let p = plan(&ctx(&w, &reg, &f), 0, &[1, 2]).unwrap();
+        let p = plan(&ctx(&w, &reg, &f, &up_to_level_2(&w)), 0, &[1, 2]).unwrap();
         assert_eq!(p.step, Step::Repair { repairer: 1 });
         assert!(p.affordable);
         // About 2000 s of repair work plus a short drive.
         assert!(p.cost_s > 2000.0 && p.cost_s < 2200.0, "{}", p.cost_s);
         // Without the scout the hauler tows it to the depot.
-        let p = plan(&ctx(&w, &reg, &f), 0, &[2]).unwrap();
+        let p = plan(&ctx(&w, &reg, &f, &up_to_level_2(&w)), 0, &[2]).unwrap();
         assert!(matches!(
             p.step,
             Step::Tow {
@@ -671,7 +727,7 @@ mod tests {
             state("hauler", 40, 40, RobotStatus::Idle, 9000.0),
         ]);
         let f = Fixture::new(&reg);
-        let p = plan(&ctx(&w, &reg, &f), 0, &[1, 2]).unwrap();
+        let p = plan(&ctx(&w, &reg, &f, &up_to_level_2(&w)), 0, &[1, 2]).unwrap();
         assert_eq!(
             p.step,
             Step::Tow {
@@ -684,7 +740,7 @@ mod tests {
         // Once on the depot cell it is serviced where it stands.
         worker.position = GridCoord { x: 8, y: 14 };
         w.fleet.update(&[worker]);
-        let p = plan(&ctx(&w, &reg, &f), 0, &[1, 2]).unwrap();
+        let p = plan(&ctx(&w, &reg, &f, &up_to_level_2(&w)), 0, &[1, 2]).unwrap();
         assert_eq!(p.step, Step::ServiceInPlace { depot: 0 });
         assert_eq!(p.step.helper(), None);
     }
@@ -699,7 +755,7 @@ mod tests {
         ]);
         let f = Fixture::new(&reg);
         // The hauler is next door: a short tow beats the scout's long repair.
-        let p = plan(&ctx(&w, &reg, &f), 0, &[1, 2]).unwrap();
+        let p = plan(&ctx(&w, &reg, &f, &up_to_level_2(&w)), 0, &[1, 2]).unwrap();
         assert!(
             matches!(
                 p.step,
@@ -715,7 +771,7 @@ mod tests {
         // Offline with the charger beside it: charge in place.
         w.fleet
             .update(&[state("worker", 30, 30, RobotStatus::Offline, 0.0)]);
-        let p = plan(&ctx(&w, &reg, &f), 0, &[1]).unwrap();
+        let p = plan(&ctx(&w, &reg, &f, &up_to_level_2(&w)), 0, &[1]).unwrap();
         assert_eq!(
             p.step,
             Step::ChargeInPlace {
@@ -725,7 +781,7 @@ mod tests {
         // Charger far away: bring it over.
         w.fleet
             .update(&[state("hauler", 50, 10, RobotStatus::Idle, 9000.0)]);
-        let p = plan(&ctx(&w, &reg, &f), 0, &[1, 2]).unwrap();
+        let p = plan(&ctx(&w, &reg, &f, &up_to_level_2(&w)), 0, &[1, 2]).unwrap();
         assert!(
             matches!(
                 p.step,
@@ -736,7 +792,7 @@ mod tests {
         // At the station: charge there.
         w.fleet
             .update(&[state("worker", 10, 10, RobotStatus::Offline, 0.0)]);
-        let p = plan(&ctx(&w, &reg, &f), 0, &[]).unwrap();
+        let p = plan(&ctx(&w, &reg, &f, &up_to_level_2(&w)), 0, &[]).unwrap();
         assert_eq!(
             p.step,
             Step::ChargeInPlace {
@@ -757,19 +813,19 @@ mod tests {
         ]);
         let mut f = Fixture::new(&reg);
         // The scout cannot afford the repair now; the hauler can tow.
-        let p = plan(&ctx(&w, &reg, &f), 0, &[1, 2]).unwrap();
+        let p = plan(&ctx(&w, &reg, &f, &up_to_level_2(&w)), 0, &[1, 2]).unwrap();
         assert!(matches!(p.step, Step::Tow { .. }), "{p:?}");
-        let p = plan(&ctx(&w, &reg, &f), 0, &[1]).unwrap();
+        let p = plan(&ctx(&w, &reg, &f, &up_to_level_2(&w)), 0, &[1]).unwrap();
         assert_eq!(p.step, Step::Repair { repairer: 1 });
         assert!(!p.affordable && p.helper_need_wh > 200.0);
         f.engaged.insert(0);
-        assert!(plan(&ctx(&w, &reg, &f), 0, &[1, 2]).is_none());
+        assert!(plan(&ctx(&w, &reg, &f, &up_to_level_2(&w)), 0, &[1, 2]).is_none());
         // Healthy robots need nothing.
-        assert!(plan(&ctx(&w, &reg, &f), 2, &[1]).is_none());
+        assert!(plan(&ctx(&w, &reg, &f, &up_to_level_2(&w)), 2, &[1]).is_none());
     }
 
     #[test]
-    fn cannibalizing_waits_for_the_policy() {
+    fn cannibalizing_needs_a_redundant_donor_and_the_authority_layer() {
         let (mut w, reg) = setup();
         let mut worker = state("worker", 30, 30, RobotStatus::Failed, 3000.0);
         worker.faults = vec![fault("tool", Severity::Disabled, false)];
@@ -782,18 +838,74 @@ mod tests {
         ]);
         w.depots.clear();
         let f = Fixture::new(&reg);
-        // The hauler is the only tower and charger, so it is no donor, and
-        // the default policy puts cannibalize at level 3 anyway.
-        w.policy
-            .levels
-            .insert("cannibalize".into(), AuthorityLevel::APPROVE_IF_REACHABLE);
-        assert!(!permitted(&w.policy, "cannibalize"));
-        assert!(permitted(&w.policy, "tow") || w.policy.level_for("tow").get() > 2);
-        assert!(plan(&ctx(&w, &reg, &f), 0, &[1]).is_none());
-        w.policy
-            .levels
-            .insert("cannibalize".into(), AuthorityLevel::NOTIFY);
-        assert!(donors(&ctx(&w, &reg, &f), 0, 1).is_empty());
+        // The hauler is the only tower and charger, so it is no donor.
+        let may = up_to_level_2(&w);
+        assert!(donors(&ctx(&w, &reg, &f, &may), 0, 1).is_empty());
+        assert!(best_cannibalize(&ctx(&w, &reg, &f, &may), 0, &[1]).is_none());
+        assert!(plan(&ctx(&w, &reg, &f, &may), 0, &[1]).is_none());
+    }
+
+    #[test]
+    fn a_redundant_donor_is_used_only_once_the_strip_is_allowed() {
+        // A second sinterer, failed beyond field repair, is a redundant donor
+        // while a third one works.
+        let sinterer = |id: &str| {
+            robot(
+                id,
+                0.15,
+                vec![cap(CapabilityName::Sinter, 0.01, 60.0, None)],
+            )
+        };
+        let mut sc = scenario(vec![
+            sinterer("worker"),
+            robot(
+                "scout",
+                0.5,
+                vec![
+                    cap(CapabilityName::Scan, 4.0, 0.05, None),
+                    cap(CapabilityName::Repair, 0.0005, 400.0, None),
+                ],
+            ),
+            sinterer("spare"),
+            sinterer("other"),
+        ]);
+        sc.site.width = 60;
+        sc.site.height = 60;
+        let mut w = WorldModel::new(&sc);
+        let reg = Registry::new(&sc);
+        let mut worker = state("worker", 30, 30, RobotStatus::Failed, 3000.0);
+        worker.faults = vec![fault("tool", Severity::Disabled, false)];
+        let mut spare = state("spare", 31, 31, RobotStatus::Failed, 3000.0);
+        spare.faults = vec![fault("wheels", Severity::Disabled, false)];
+        w.fleet.update(&[
+            worker,
+            state("scout", 29, 30, RobotStatus::Idle, 1400.0),
+            spare,
+            state("other", 10, 10, RobotStatus::Idle, 3000.0),
+        ]);
+        let f = Fixture::new(&reg);
+        let may = up_to_level_2(&w);
+        // No depot and no tower: stripping the spare is the only way back,
+        // but it is not allowed yet, so nothing is planned...
+        let c = ctx(&w, &reg, &f, &may);
+        assert!(plan(&c, 0, &[1]).is_none());
+        // ... though it is what to ask Earth about.
+        let ask = best_cannibalize(&c, 0, &[1]).unwrap();
+        assert_eq!(
+            ask.step,
+            Step::Cannibalize {
+                executor: 1,
+                donor: 2
+            }
+        );
+        assert_eq!(ask.step.action(), "cannibalize");
+        // Once that strip is allowed it is planned.
+        let spare_only = |d: usize| d == 2;
+        let c = Ctx {
+            may_strip: &spare_only,
+            ..ctx(&w, &reg, &f, &may)
+        };
+        assert_eq!(plan(&c, 0, &[1]).unwrap().step, ask.step);
     }
 
     #[test]
