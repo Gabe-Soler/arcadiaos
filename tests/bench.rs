@@ -2,14 +2,15 @@
 //! simulator.
 //!
 //! Set `ARCADIABENCH` to the path of an `arcadiabench` binary to run these;
-//! without it they print a note and pass. Run them in release so the
+//! without it they print a note and pass. They use the `nominal` variant
+//! (hybrid power and the nominal fault model). Run them in release so the
 //! coordinator under test is the release build:
 //!
 //! ```sh
 //! ARCADIABENCH=/path/to/arcadiabench cargo test --release --test bench
 //! ```
 
-use arcadia_protocol::{EndReason, LogEntry, LogRecord, wire};
+use arcadia_protocol::{EndReason, LogEntry, LogRecord, RunMetrics, wire};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -34,10 +35,20 @@ fn log_path(name: &str) -> PathBuf {
         .join(format!("bench-{name}-{}.jsonl", std::process::id()))
 }
 
+/// The scenario variant every run here uses.
+const VARIANT: &str = "nominal";
+
 /// Run one seed and return the simulator's one-line summary.
 fn run(bench: &Path, seed: u64, log: &Path) -> String {
     let out = Command::new(bench)
-        .args(["run", "--seed", &seed.to_string(), "--log"])
+        .args([
+            "run",
+            "--seed",
+            &seed.to_string(),
+            "--variant",
+            VARIANT,
+            "--log",
+        ])
         .arg(log)
         .arg("--")
         .arg(env!("CARGO_BIN_EXE_arcadiaos"))
@@ -53,15 +64,15 @@ fn run(bench: &Path, seed: u64, log: &Path) -> String {
     stdout
 }
 
-/// The reason recorded in the log's `run_end` record.
-fn logged_end(log: &Path) -> EndReason {
+/// The reason and metrics recorded in the log's `run_end` record.
+fn logged_end(log: &Path) -> (EndReason, RunMetrics) {
     let mut reader = BufReader::new(File::open(log).expect("open log"));
     let mut last = None;
     while let Some(record) = wire::recv::<_, LogRecord>(&mut reader).expect("valid log record") {
         last = Some(record);
     }
     match last.map(|r| r.entry) {
-        Some(LogEntry::RunEnd { reason }) => reason,
+        Some(LogEntry::RunEnd { reason, metrics }) => (reason, metrics),
         other => panic!("log does not end with run_end: {other:?}"),
     }
 }
@@ -81,8 +92,18 @@ fn seeds_one_to_three_complete_the_pad() {
         let log = log_path(&format!("seed{seed}"));
         let summary = run(&bench, seed, &log);
         assert!(summary.contains("GoalsComplete"), "seed {seed}: {summary}");
-        assert_eq!(logged_end(&log), EndReason::GoalsComplete, "seed {seed}");
-        eprintln!("seed {seed}: {summary} ({:?} sols)", sols(&summary));
+        let (reason, m) = logged_end(&log);
+        assert_eq!(reason, EndReason::GoalsComplete, "seed {seed}");
+        assert!(m.completed, "seed {seed}");
+        assert_eq!(m.fleet.robots_lost, 0, "seed {seed}: no robot is given up");
+        eprintln!(
+            "seed {seed} ({VARIANT}): {:.3} sols, {} faults, {:.1} robot-hours lost, {} rejections ({:?} sols in the summary)",
+            m.sols,
+            m.fleet.faults,
+            m.fleet.robot_hours_lost,
+            m.commands_rejected,
+            sols(&summary)
+        );
         let _ = fs::remove_file(&log);
     }
 }

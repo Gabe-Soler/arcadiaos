@@ -372,7 +372,9 @@ mod tests {
                 dust_coverage: 0.0,
                 temperature_c: -50.0,
             },
+            faults: vec![],
             in_relay_coverage: true,
+            telemetry_t: 0.0,
         }
     }
 

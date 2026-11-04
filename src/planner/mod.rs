@@ -794,10 +794,13 @@ impl Planner {
         }
     }
 
-    /// Record material deposited on a berm cell.
+    /// Record material deposited on a berm cell. A deposit also uses up any
+    /// extra material a failed check asked for, so the cell's need falls to
+    /// zero and the next check scan follows.
     pub fn record_berm_deposit(&mut self, i: usize, kg: f64) {
         if let Some(b) = self.berm.get_mut(i) {
             b.deposited_kg += kg.max(0.0);
+            b.extra_kg = (b.extra_kg - kg.max(0.0)).max(0.0);
             b.confirmed = false;
         }
     }

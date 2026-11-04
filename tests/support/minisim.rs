@@ -253,6 +253,17 @@ impl MiniSim {
                 robots: s.robots.iter().map(|r| r.0.clone()).collect(),
                 stations: s.stations.clone(),
                 depots: vec![],
+                power: PowerSystem {
+                    mode: PowerMode::Hybrid,
+                    fission_w: 10_000.0,
+                    solar_peak_w: 20_000.0,
+                    storage_capacity_wh: 100_000.0,
+                    essential_load_w: 2_000.0,
+                },
+                base_station: BaseStation {
+                    position: GridCoord { x: 0, y: 0 },
+                    range_m: 1000.0,
+                },
                 policy,
             },
         };
@@ -471,7 +482,9 @@ impl MiniSim {
                         dust_coverage: 0.0,
                         temperature_c: -50.0,
                     },
+                    faults: vec![],
                     in_relay_coverage: true,
+                    telemetry_t: self.t,
                 })
                 .collect(),
         }

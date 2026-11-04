@@ -74,14 +74,13 @@ pub fn robot_energy_wh(
     w: &CapWork,
     cfg: &Config,
 ) -> f64 {
-    let rc = reg.robot(r);
     let (work_s, travel_s) = robot_times(reg, r, cap, w, cfg);
     if !work_s.is_finite() || !travel_s.is_finite() {
         return f64::INFINITY;
     }
     w.units * w.passes.max(1.0) * reg.energy_per_unit(r, cap)
-        + w.steps * w.travel_m_per_step * rc.drive_wh_per_m
-        + (work_s + travel_s) * rc.idle_w / 3600.0
+        + w.steps * w.travel_m_per_step * reg.drive_wh_per_m(r)
+        + reg.idle_wh(r, work_s + travel_s)
 }
 
 fn robot_times(
@@ -92,7 +91,7 @@ fn robot_times(
     cfg: &Config,
 ) -> (f64, f64) {
     let rate = reg.rate(r, cap);
-    let speed = reg.robot(r).speed_m_s;
+    let speed = reg.speed_m_s(r);
     if rate <= 0.0 {
         return (f64::INFINITY, f64::INFINITY);
     }

@@ -90,6 +90,17 @@ fn hello(robots: Vec<RobotSpec>, stations: Vec<ChargeStation>) -> Box<Hello> {
             robots,
             stations,
             depots: vec![],
+            power: PowerSystem {
+                mode: PowerMode::Hybrid,
+                fission_w: 10_000.0,
+                solar_peak_w: 20_000.0,
+                storage_capacity_wh: 100_000.0,
+                essential_load_w: 2_000.0,
+            },
+            base_station: BaseStation {
+                position: GridCoord { x: 0, y: 0 },
+                range_m: 1000.0,
+            },
             policy: Policy {
                 policy_version: 1,
                 default_level: AuthorityLevel::NOTIFY,
@@ -117,7 +128,9 @@ fn state(id: &str, x: u32, y: u32) -> RobotState {
             dust_coverage: 0.0,
             temperature_c: -50.0,
         },
+        faults: vec![],
         in_relay_coverage: true,
+        telemetry_t: 0.0,
     }
 }
 
