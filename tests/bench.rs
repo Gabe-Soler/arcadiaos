@@ -85,7 +85,7 @@ fn logged_end(log: &Path) -> (EndReason, RunMetrics, Vec<RejectReason>) {
     }
 }
 
-/// Sols from a summary like `arcadiaos 0.1.0: GoalsComplete at sol 0.78 | ...`.
+/// Sols from a summary like `arcadiaos 1.0.0: GoalsComplete at sol 0.78 | ...`.
 fn sols(summary: &str) -> Option<f64> {
     let rest = summary.split(" at sol ").nth(1)?;
     rest.split_whitespace().next()?.parse().ok()
@@ -167,7 +167,7 @@ fn same_seed_gives_identical_logs() {
 fn summary_parsing() {
     assert_eq!(
         sols(
-            "arcadiaos 0.1.0: GoalsComplete at sol 0.78 | pad 100% | 1833 decisions, 1837 commands"
+            "arcadiaos 1.0.0: GoalsComplete at sol 0.78 | pad 100% | 1833 decisions, 1837 commands"
         ),
         Some(0.78)
     );

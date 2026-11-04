@@ -854,7 +854,8 @@ impl State {
             RejectReason::RobotDisabled | RejectReason::OutOfCoverage => {
                 self.exec.back_off_robot(r, t + 60.0);
             }
-            // Authority enforcement arrives in week 6; until then pad work is level 1.
+            // The authority layer asks Earth before acting, so these should not
+            // happen; if one does, the task waits out a back-off.
             RejectReason::ApprovalRequired | RejectReason::Vetoed => {
                 self.exec.back_off(r, task.key, t + cfg.retry_backoff_s);
             }

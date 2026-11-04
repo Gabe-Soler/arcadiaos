@@ -1,6 +1,8 @@
 # ArcadiaOS architecture
 
-ArcadiaOS is the coordinator: it turns Earth's goal into work for a crew of robots and keeps that work on track. This document describes the v1 core delivered in roadmap weeks 3–4 (world model, capability registry, planner, allocation, scheduling, energy policy and executor), the week-5 additions (fault response, predictive maintenance and energy-aware scheduling), the week-6 additions (the authority layer, Earth messages, blackout behaviour and coverage-aware planning) and the week-9 tuning of allocation against the benchmark's baselines.
+ArcadiaOS is the coordinator: it turns Earth's goal into work for a crew of robots and keeps that work on track. This document describes ArcadiaOS 1.0: the world model, capability registry, planner, allocation, scheduling, energy policy and executor at its core; fault response and predictive maintenance; the authority layer, Earth messages and blackout behaviour; coverage-aware planning; and how it does on ArcadiaBench 1.0.
+
+ArcadiaOS speaks arcadia-protocol 1.0.0. The protocol's [semantics](https://github.com/Gabe-Soler/arcadia-protocol/blob/v1.0.0/docs/semantics.md) define everything it can rely on, and the few simulator constants no message carries are listed in their appendix; [Tuning](#tuning) says which of them ArcadiaOS assumes.
 
 ## Principles
 
@@ -281,7 +283,7 @@ At the default delay of 720 s an answer is expected in 2640 s, within the defaul
 | `relay_benefit_ratio` | 1.5 | Saving needed per second a relay costs. |
 | `stranded_margin_s` | 1800 s | Out of contact this long past its expected return: stranded. |
 
-On ArcadiaBench's `landing-pad-small` the base station covers the pad but not the berm. Week 5's coordinator built the berm by hauling onto it and scanning it from its own row, so the scout, hauler and excavator spent about 18 robot-hours a run out of contact waiting for lost-link returns. Now the berm is built from the row of borrow cells just south of it, and berm scans are entered from that row: no robot leaves coverage, and the relay is never needed.
+On ArcadiaBench the base station covers the pad but not the berm. Building the berm by hauling onto it and scanning it from its own row cost the Small crew's scout, hauler and excavator about 18 robot-hours a run out of contact, waiting for lost-link returns. So the berm is built from the row of borrow cells just south of it, and berm scans are entered from that row: no robot leaves coverage, and the relay is never needed.
 
 ## Health and predictive maintenance
 
@@ -354,9 +356,9 @@ ArcadiaOS never issues a command that would complete instantly, such as a move t
 - **`tests/session.rs`:** the real binary over stdio. It covers the handshake, version errors, planning once the goal arrives, back-off after a rejection, and silence by default.
 - **`tests/bench.rs`:** the real binary under ArcadiaBench (`nominal` and `conjunction` variants), when `ARCADIABENCH` is set. Seeds 1–3 of each must finish `goals_complete` with no robot lost, no policy violation, no `approval_required` or `out_of_coverage` rejection and at least one status report (metrics are read from `run_end`), and the same seed twice must give byte-identical logs.
 
-## Results (ArcadiaBench week 9, the full catalog)
+## Results
 
-ArcadiaBench week 9 added the random, greedy and first-come-first-served baselines and benchmarked them with ArcadiaOS on every preset and variant, seeds 1–50, in release; its `results/v1.0/RESULTS.md` has every scorecard. Week 9 also moved the dust storm and the conjunction blackout to the first 0.03 sol, so they overlap every preset's build. Headline (success rate × mean speed), nominal variant:
+ArcadiaBench 1.0 benchmarks ArcadiaOS 1.0 and its three baseline coordinators on every preset and variant, seeds 1–50, in release; its [`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/ArcadiaBench/blob/v1.0.0/results/v1.0/RESULTS.md) has every scorecard. Headline (success rate × mean speed), nominal variant:
 
 | Coordinator | Small | Medium | Large |
 |---|---|---|---|
@@ -365,63 +367,16 @@ ArcadiaBench week 9 added the random, greedy and first-come-first-served baselin
 | random baseline | 0.499 | 0.677 | 0.587 |
 | first-come-first-served baseline | 0.385 | 0.419 | 0.362 |
 
-- ArcadiaOS completed all 900 of its runs, as did every baseline, with no policy violation and no robot lost, and has the best headline in all 18 scenarios: 10–21% above greedy's. On the nominal build it finishes the pad 15% faster than greedy, averaged over the presets, with no more Earth interventions: neither asks Earth for anything. Across the catalog it asked twice in 900 runs, both to cannibalize a robot in Large `cascading_faults`.
+- ArcadiaOS completed all 900 of its runs, as did every baseline, and has the best headline in all 18 scenarios: 10–21% above greedy's. Its mean nominal build takes 0.81 sols on Small, 0.15 on Medium and 0.079 on Large.
+- In those 900 runs it issued 1.6 million commands and none was rejected. Its robots met 343 faults, it lost no robot and committed no policy violation.
+- On the nominal build it finishes the pad 15% faster than greedy, averaged over the presets, and neither needs Earth there. Across the catalog it asked Earth twice, both to cannibalize a robot in Large `cascading_faults`.
 - Suite resilience is 0.975, against greedy's 0.967. Greedy keeps slightly more of its own nominal headline on Medium (0.980 against 0.976) and Large (0.990 against 0.987): a fault costs both about the same time, and that is a larger share of ArcadiaOS's shorter build.
-- The feeding-step rule above is the week-9 change. Against the same simulator on seeds 1–20, it raised the Large nominal headline from 0.651 to 0.706 and Medium's from 0.736 to 0.750; Small, with one compactor-sinterer, was unchanged. No run failed before or after the change.
-- On Small the build is bound by the single compactor-sinterer, which needs about 26 kWh for the pad, three times its battery, so about six hours of a 0.81-sol build go on charging.
+- **Where the time goes.** On Small the build is bound by the single compactor-sinterer, which needs about 26 kWh for the pad, three times its battery, so about six hours of a 0.81-sol build go on charging. On Medium and Large it is the compactor-sinterers' driving between cells, which the feeding-step rule in [Dispatch](#dispatch-sequential-auction) cuts: on seeds 1–20 it raised the Large nominal headline from 0.651 to 0.706 and Medium's from 0.736 to 0.750, and left Small, with one compactor-sinterer, unchanged.
+- Decisions take a fraction of a millisecond: whole Large runs average under 0.14 ms a decision, simulator included. Runs on the same seed are byte-identical.
 
-## Results (ArcadiaBench week 6, `landing-pad-small`)
-
-Measured against ArcadiaBench `7c41a92` in release, from each log's `run_end.metrics`:
-
-| Variant | Completed | Sols (mean, min–max) | Policy violations | Notifies | Status reports | Approval requests | Robot time out of coverage |
-|---|---|---|---|---|---|---|---|
-| `nominal`, seeds 1–20 | 20 / 20 | 0.806, 0.788–0.880 | 0 | 14 | 20 | 0 | 0 s |
-| `conjunction`, seeds 1–20 | 20 / 20 | 0.806, 0.788–0.880 | 0 | 14 | 20 | 0 | 0 s |
-| `cascading_faults`, seeds 1–20 | 20 / 20 | 0.876, 0.856–0.944 | 0 | 71 | 20 | 0 | 3 s |
-| `solar_only`, seeds 1–10 | 10 / 10 | 0.799, 0.792–0.807 | 0 | 4 | 10 | 0 | 0 s |
-| `nuclear_heavy`, seeds 1–10 | 10 / 10 | 0.799, 0.788–0.808 | 0 | 4 | 10 | 0 | 0 s |
-
-- No command was rejected (no `approval_required`, `vetoed` or `out_of_coverage`), no robot was lost, and runs are byte-identical across repeats.
-- Notifies report every `tow`, `replan` and `reassign_task`; each run fits in under a sol, so it sends one status report.
-- No run cannibalized: in the four-robot crew no robot is redundant, so there is never a donor. The approval flow is covered by the coordinator tests.
-- The 3 s is one excavator drive between two borrow cells that clips a cell just outside coverage.
-- The week-5 coordinator, run against the same simulator, finished `nominal` and `conjunction` seeds 1–10 in 0.802 sols on average with one violation each (a `tow` with no notify), its robots out of contact for hours a run. Week 6 takes 0.799 on both.
-
-Decisions take about 0.03 ms on average and about 0.1 ms at most.
-
-## Results (ArcadiaBench week 5, `landing-pad-small`)
-
-Measured against ArcadiaBench `6f4e1b2` in release, from each log's `run_end.metrics`:
-
-| Variant | Completed | Sols (mean, min–max) | Faults per run | Robot-hours lost (mean, max) | Rejections |
-|---|---|---|---|---|---|
-| `nominal`, seeds 1–20 | 20 / 20 | 0.811, 0.791–0.881 | 0.3 | 0.23, 2.09 | 0 |
-| `cascading_faults`, seeds 1–20 | 20 / 20 | 0.875, 0.840–0.965 | 1.4 | 0.70, 2.87 | 0 |
-| `solar_only`, seeds 1–10 | 10 / 10 | 0.807, 0.792–0.873 | 0.3 | 0.21, 2.05 | 0 |
-| `nuclear_heavy`, seeds 1–10 | 10 / 10 | 0.806, 0.791–0.872 | 0.3 | 0.21, 2.05 | 0 |
-
-No robot was lost, the grid never ran short, and the lowest bank level was 44% of capacity (in `solar_only`). Decisions take about 0.02 ms on average and under 0.15 ms at most. Runs are byte-identical across repeats, faulty seeds included.
-
-The week 3–4 core, run against the same simulator, completed 18 of 20 `nominal` seeds and 3 of 20 `cascading_faults` seeds. In `nominal` seeds 2 and 13, a fault that needed the depot left the compactor-sinterer failed until it drained. In `cascading_faults`, stuck and failed robots were never freed. Now a disabling fault costs the tow (a few minutes) plus a two-hour service, and seeds without faults run as fast as before.
-
-Week 5 also fixed a planner bug that only longer runs expose. After a failed berm check, the extra material requested was never used up by deposits, so the crew hauled to the berm for ever and the confirming scan never came.
-
-## Results (ArcadiaBench week 2, `landing-pad-small`)
-
-| | Seeds 1–20 |
-|---|---|
-| Completed | 20 / 20 (also 40 / 40 on seeds 21–60) |
-| Sols | mean 0.774, min 0.765, max 0.783 (scripted builder ≈ 1.6) |
-| Decisions | 1,759–1,859 per run |
-| Commands | 1,759–1,860 per run; 0 rejected, 0 failed |
-| Decision time | about 0.02 ms on average and under 0.1 ms at most, in release |
-
-The run is bound by the single compactor-sinterer, which is busy essentially all the time: about 11.2 h sintering, 2 h compacting and 6 h charging, trips to the station included. The theoretical floor for this crew is about 0.76 sol.
+ArcadiaBench's [demo replays](https://github.com/Gabe-Soler/ArcadiaBench/blob/v1.0.0/docs/demos.md) show ArcadiaOS through a nominal build, a dust storm, a conjunction blackout and cascading faults.
 
 ## Extension points
-
-### After week 6
 
 - **Approvals.** New level-3 actions plug into `State::weigh_cannibalize` (its stakes) or `State::ask_earth` (generic), and are cited from `Authority::authorization`.
 - **Coverage.** Relay placement is a heuristic over covered cells; a crew with several relays, or sites mostly out of coverage, could plan relay chains.
@@ -442,4 +397,4 @@ All assumptions and knobs live in `Config` (`src/config.rs`). They cover:
 - Earth and authority: the response time, the answer margin, the risk and benefit prices of the level-3 rule, and the status period;
 - coverage: the lost-link timeout, relay radio power, borrow depth, relay benefit ratio and stranding margin.
 
-The health, repair, Earth response, lost-link and relay numbers are interface assumptions taken from the reference simulator's documentation. ArcadiaOS uses them to rank options, and corrects energy and time estimates from what it measures. None is specific to a seed, a crew or a site.
+The grade window, the work floor, the tow, service and repair numbers, the heater, the Earth response time, the lost-link timeout and the relay radio power are interface assumptions: the values the protocol's semantics list as ArcadiaBench 1.0's reference constants. The health model's coefficients and nominal wear rates come from ArcadiaBench's `docs/simulator.md`, and the cold window is deliberately wider than the reference simulator's. ArcadiaOS uses these numbers to rank options, and corrects energy and time estimates from what it measures. None is specific to a seed, a crew or a site.

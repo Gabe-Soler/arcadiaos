@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "arcadia-protocol"
-version = "0.2.0"
-source = "git+https://github.com/Gabe-Soler/arcadia-protocol?tag=v0.2.0#faafd4aff495ee14f36f2668490b3c1c100e0fd2"
+version = "1.0.0"
+source = "git+https://github.com/Gabe-Soler/arcadia-protocol?tag=v1.0.0#163e92a30dee7b41aa1717e3b3aa7dddcf718e14"
 dependencies = [
  "serde",
  "serde_json",
@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "arcadiaos"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arcadia-protocol",
 ]
