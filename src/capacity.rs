@@ -267,6 +267,12 @@ impl CapacityPlan {
         plan
     }
 
+    /// Whether the set of working robots differs from the one this plan was
+    /// solved for (and there was a plan): re-solving would be a replan.
+    pub fn fleet_changed(&self, available: &[bool]) -> bool {
+        !self.solved_available.is_empty() && self.solved_available != available
+    }
+
     /// Whether the plan should be re-solved for this workload and fleet.
     pub fn stale(&self, workload: &Workload, available: &[bool]) -> bool {
         if self.solved_available != available {

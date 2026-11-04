@@ -17,16 +17,33 @@ ArcadiaOS turns Earth's landing-pad goal into work for the whole crew. It uses o
   - Optional charging stays off the site grid when a night or storm would drain the bank, and takes surplus solar when the bank is full.
   - Idle robots park charged for cold nights.
 - **Recovers from faults.**
-  - Stuck, failed and offline robots are brought back by the cheapest permitted option: field repair, a tow to a depot for service, a tow to a station, or a mobile charger.
+  - Stuck, failed and offline robots are brought back by the cheapest permitted option: field repair, a tow to a depot for service, a tow to a station, a mobile charger, or parts from a redundant donor once Earth agrees.
   - Degraded robots get adjusted rate and energy estimates.
   - Wear is inferred from noisy health telemetry and usage, and preventive repairs or services are scheduled when they pay off, preferably at natural breaks.
+- **Answers to Earth.** Every action goes through the authority policy in effect, updated whenever Earth sends a new one. Level-1 actions are taken, level-2 actions are taken and notified in the same decision, level-3 actions wait for Earth only as long as a cost model says waiting is worth it (and fall back by the same model when Earth cannot answer in time), and level-4 actions are never taken without Earth's approval. A status report goes to Earth about once a sol.
+- **Keeps working through blackouts.** Nothing waits on an Earth it cannot reach: during a conjunction or an outage the fallback rule decides at once, notifies are stored and forwarded, and status reports catch up when the link returns.
+- **Plans for coverage.** Robots out of range of the comms base station are never commanded, and their late events are folded in when they return. Work is kept inside coverage (scans entered from covered cells, berm material cast from covered borrow cells), and a relay robot is stationed when work beyond coverage makes it pay.
 - **Executes** commands through their whole lifecycle (accepted, rejected, completed, failed), with back-off and retries, cancellation of interruptible jobs, and `wake_at`. It recovers from surprises by rescanning and reworking.
 
 Robots are described only by their capabilities, so roles emerge from allocation and any crew works. See [docs/architecture.md](docs/architecture.md) for the design.
 
 ## Status
 
-**Week 5: fault response, predictive maintenance and energy-aware scheduling.** On the ArcadiaBench week-5 simulator (`landing-pad-small`, four robots, faults and wear on), every run tested builds and verifies the pad:
+**Week 6: authority, Earth in the loop, blackouts and coverage.** On the ArcadiaBench week-6 simulator (`landing-pad-small`, four robots; faults and wear, the Earth link with light-time delay and outages, authority enforcement and site coverage), every run tested builds and verifies the pad within the policy:
+
+| Variant | Completed | Sols (mean, min–max) | Policy violations | Messages to Earth (notifies, status reports) |
+|---|---|---|---|---|
+| `nominal`, seeds 1–20 | 20 / 20 | 0.806, 0.788–0.880 | 0 | 34 (14, 20) |
+| `conjunction`, seeds 1–20 | 20 / 20 | 0.806, 0.788–0.880 | 0 | 34 (14, 20) |
+| `cascading_faults`, seeds 1–20 | 20 / 20 | 0.876, 0.856–0.944 | 0 | 91 (71, 20) |
+| `solar_only`, seeds 1–10 | 10 / 10 | 0.799, 0.792–0.807 | 0 | 14 (4, 10) |
+| `nuclear_heavy`, seeds 1–10 | 10 / 10 | 0.799, 0.788–0.808 | 0 | 14 (4, 10) |
+
+- No command is rejected (no `approval_required`, `vetoed` or `out_of_coverage`), no robot is lost, and runs are byte-identical across repeats.
+- No robot leaves the base station's coverage (bar one 3 s clip in 20 `cascading_faults` runs), where week 5's coordinator lost hours of robot time a run to lost-link returns.
+- No run needs an approval: the default policy asks for none of what this crew does, and no robot in it is redundant enough to be a donor.
+
+**Week 5: fault response, predictive maintenance and energy-aware scheduling.** On the ArcadiaBench week-5 simulator, every run tested built and verified the pad:
 
 | Variant | Completed | Sols (mean, min–max) | Robot-hours lost (mean) |
 |---|---|---|---|
@@ -35,13 +52,11 @@ Robots are described only by their capabilities, so roles emerge from allocation
 | `solar_only`, seeds 1–10 | 10 / 10 | 0.807, 0.792–0.873 | 0.21 |
 | `nuclear_heavy`, seeds 1–10 | 10 / 10 | 0.806, 0.791–0.872 | 0.21 |
 
-- No command is rejected and no robot is lost.
-- Decisions take about 0.02 ms on average, and runs with the same seed produce byte-identical logs.
+- No command was rejected and no robot was lost.
+- Decisions took about 0.02 ms on average, and runs with the same seed produced byte-identical logs.
 - The week 3–4 core managed 18 of 20 `nominal` and 3 of 20 `cascading_faults` seeds on the same simulator.
 
 **Weeks 3–4: core coordinator.** On the week-2 simulator, seeds 1–20 finished in 0.774 sols on average (0.765–0.783), against about 1.6 sols for the naive scripted builder. On synthetic scenarios ArcadiaOS also handles crews of 3 to 20 robots with overlapping capability sets, several stations, small batteries, mobile charging and rescue, and a crew with no hauler.
-
-Not yet: the authority policy, approvals, Earth messages and comms-blackout behaviour (week 6). Until then the policy is recorded but not enforced, except that recovery never uses an action above level 2 (so `cannibalize` waits for the approval flow), and nothing is sent to Earth.
 
 ## Run
 
@@ -65,7 +80,7 @@ cargo fmt --check
 ARCADIABENCH=/path/to/arcadiabench cargo test --release --test bench
 ```
 
-CI runs the checks above. A separate job builds ArcadiaBench at the commit pinned in `BENCH_REF` and runs the end-to-end test (the `nominal` variant) against it.
+CI runs the checks above. A separate job builds ArcadiaBench at the commit pinned in `BENCH_REF` and runs the end-to-end tests (the `nominal` and `conjunction` variants) against it.
 
 ## License
 

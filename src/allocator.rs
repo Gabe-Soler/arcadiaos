@@ -10,7 +10,11 @@
 //!       + seq_weight × (1 − u) × sweep rank  (keep the pipeline in order)
 //!       + crowd_penalty × same-capability robots already in the section
 //!       + help_penalty if the capability is not one of the robot's roles
+//!       + lost-link wait if the work leaves the robot out of coverage
 //! ```
+//!
+//! Scans are entered from a covered cell where growing the scan area a
+//! little makes that possible.
 //!
 //! where `u` is the robot's utilisation in the capacity plan: the bottleneck
 //! (u ≈ 1) mostly minimises its own travel, while robots with slack follow the
@@ -23,6 +27,7 @@
 
 use crate::capacity::CapacityPlan;
 use crate::config::Config;
+use crate::coverage::{self, Coverage};
 use crate::energy::Energy;
 use crate::geom;
 use crate::planner::{Busy, Planner, SpoilKind, SpoilTarget};
@@ -88,6 +93,8 @@ pub struct WorkPlan {
     pub haul: Option<HaulPlan>,
     /// Dig details.
     pub dig: Option<DigPlan>,
+    /// The robot ends out of coverage: unreachable until its lost-link return.
+    pub strands: bool,
 }
 
 /// Why a robot cannot bid on a task.
@@ -116,6 +123,8 @@ pub struct Context<'a> {
     pub busy: &'a Busy,
     /// Robots per (capability, section) already working there.
     pub crowd: &'a BTreeMap<(CapabilityName, usize), usize>,
+    /// The covered part of the site.
+    pub coverage: &'a Coverage,
 }
 
 /// Plan task `t` for robot `r`. Dig spoil destinations are chosen later, by
@@ -129,20 +138,36 @@ pub fn plan_work(ctx: &Context, r: usize, t: &Task) -> Result<WorkPlan, NoBid> {
     if !reg.can(r, cap) {
         return Err(NoBid::Unable);
     }
-    let plan = match t.stage {
+    let site = &ctx.world.site;
+    let mut plan = match t.stage {
         Stage::Survey | Stage::Verify | Stage::BermCheck | Stage::Recheck => {
-            let at = t.entry(pos);
+            // Enter from a covered cell if a slightly larger scan allows it.
+            let area = coverage::safe_scan_area(
+                &t.area,
+                pos,
+                ctx.coverage,
+                site.width,
+                site.height,
+                SCAN_GROW_CELLS,
+            )
+            .unwrap_or(t.area);
+            let amount = if area == t.area {
+                t.amount
+            } else {
+                geom::cell_count(&area) as f64 * site.cell_area_m2()
+            };
+            let at = geom::clamp_into(pos, &area);
             let travel_s = reg.travel_s(r, pos, at);
-            let work_s = reg.work_s(r, cap, t.amount, cfg.min_work_s);
+            let work_s = reg.work_s(r, cap, amount, cfg.min_work_s);
             WorkPlan {
-                action: Action::Scan { area: t.area },
+                action: Action::Scan { area },
                 end: at,
                 travel_s,
                 duration_s: travel_s + work_s,
-                energy_wh: reg.travel_wh(r, pos, at)
-                    + reg.work_wh(r, cap, t.amount, cfg.min_work_s),
+                energy_wh: reg.travel_wh(r, pos, at) + reg.work_wh(r, cap, amount, cfg.min_work_s),
                 haul: None,
                 dig: None,
+                strands: false,
             }
         }
         Stage::Dig | Stage::Grade | Stage::Compact | Stage::Sinter => {
@@ -185,12 +210,19 @@ pub fn plan_work(ctx: &Context, r: usize, t: &Task) -> Result<WorkPlan, NoBid> {
                 energy_wh: reg.travel_wh(r, pos, c) + reg.work_wh(r, cap, t.amount, cfg.min_work_s),
                 haul: None,
                 dig,
+                strands: false,
             }
         }
         Stage::Fill | Stage::Berm => plan_haul(ctx, r, t, pos)?,
     };
     if !plan.duration_s.is_finite() {
         return Err(NoBid::Unable);
+    }
+    // Ending out of coverage leaves the robot unreachable until it drives
+    // back on its own after the lost-link timeout.
+    if !ctx.coverage.covers(plan.end) {
+        plan.strands = true;
+        plan.duration_s += cfg.lost_link_timeout_s;
     }
     if !Energy::affordable(ctx.world, reg, r, plan.energy_wh, plan.end, cfg) {
         return Err(NoBid::Unaffordable);
@@ -253,20 +285,29 @@ fn plan_haul(ctx: &Context, r: usize, t: &Task, pos: GridCoord) -> Result<WorkPl
             dump_kg: mass,
         }),
         dig: None,
+        strands: false,
     })
 }
 
-/// Choose the spoil destination for an awarded dig and write it into the action.
-pub fn finish_dig(ctx: &Context, plan: &mut WorkPlan, busy: &Busy) {
+/// Choose the spoil destination for an awarded dig and write it into the
+/// action: the berm cell a borrow dig feeds, or else the planner's choice.
+pub fn finish_dig(ctx: &Context, task: &Task, plan: &mut WorkPlan, busy: &Busy) {
     let Some(dig) = plan.dig.as_mut() else {
         return;
     };
     let Action::Dig { area, spoil_to, .. } = &mut plan.action else {
         return;
     };
-    let target = ctx
-        .planner
-        .spoil_target(ctx.world, area.min, dig.overflow_kg(), busy, ctx.cfg);
+    let forced = task.cast_to.and_then(|at| {
+        ctx.planner.berm_index(at).map(|i| SpoilTarget {
+            at,
+            kind: SpoilKind::Berm(i),
+        })
+    });
+    let target = forced.or_else(|| {
+        ctx.planner
+            .spoil_target(ctx.world, area.min, dig.overflow_kg(), busy, ctx.cfg)
+    });
     *spoil_to = target.map(|s| s.at);
     dig.spoil = target;
 }
@@ -306,6 +347,9 @@ pub struct AuctionResult {
 
 /// Fewest tasks each robot fully plans per round.
 const MIN_CANDIDATES: usize = 16;
+
+/// Most rows or columns a scan area is grown to be entered from a covered cell.
+const SCAN_GROW_CELLS: u32 = 6;
 
 /// Run one auction round over `tasks`. `cooling(robot, key)` vetoes retries
 /// that are still backing off.
@@ -364,7 +408,12 @@ pub fn auction(
                     if role {
                         affordable += 1;
                     }
-                    bids.push((plan.travel_s + extra, r, i, plan));
+                    let stranding = if plan.strands {
+                        cfg.lost_link_timeout_s
+                    } else {
+                        0.0
+                    };
+                    bids.push((plan.travel_s + extra + stranding, r, i, plan));
                 }
                 Err(NoBid::Unaffordable) if role => unaffordable = true,
                 Err(_) => {}
@@ -392,7 +441,7 @@ pub fn auction(
             continue;
         }
         if t.stage == Stage::Dig {
-            finish_dig(ctx, &mut plan, &cells);
+            finish_dig(ctx, t, &mut plan, &cells);
             if let Some(SpoilTarget {
                 at,
                 kind: SpoilKind::Fill,

@@ -10,7 +10,10 @@
 //! Alongside the pad cells the planner owns:
 //! - the material ledger ([`material`]): stockpile siting, spoil casting, haul
 //!   sources and borrow when spoil runs short;
-//! - the blast berm: each berm cell's surveyed base, deposits and confirmation;
+//! - the blast berm: each berm cell's surveyed base, deposits and
+//!   confirmation. A berm cell outside the base station's coverage is built
+//!   from a borrow cell inside it, by digs that cast their spoil onto the
+//!   berm, so no robot has to leave contact to build it;
 //! - verification batching, rework of defective cells, and a recheck loop for
 //!   the rare case where every cell looks done but the run has not ended.
 
@@ -18,6 +21,7 @@ pub mod material;
 
 use crate::capacity::{CapWork, Workload};
 use crate::config::Config;
+use crate::coverage::Coverage;
 use crate::geom::{self, Corner};
 use crate::registry::Registry;
 use crate::tasks::{Stage, Task, TaskKey};
@@ -80,6 +84,28 @@ pub struct BermCell {
     pub extra_kg: f64,
     /// A scan after the last deposit confirmed the height.
     pub confirmed: bool,
+}
+
+/// A cell inside the base station's coverage that material for a berm cell
+/// outside it is dug from, the spoil cast straight onto the berm, so building
+/// the berm never takes a robot out of contact.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Borrow {
+    /// The borrow cell.
+    pub at: GridCoord,
+    /// Deepest it may be dug, m: the first known elevation (orbital prior or
+    /// first scan) less the allowed depth. Unknown until then.
+    pub floor_m: Option<f64>,
+}
+
+/// How a berm cell's next load can be dug from its borrow cell.
+enum BorrowDig {
+    /// A dig task is ready.
+    Ready(Task),
+    /// A dig is already in flight there.
+    Busy,
+    /// No borrow cell, or it is dug out: haul instead.
+    Unavailable,
 }
 
 /// Where a dig sends spoil that does not fit in the digger's payload.
@@ -155,6 +181,11 @@ pub struct Planner {
     section_of: Vec<u32>,
     /// Berm cells.
     pub berm: Vec<BermCell>,
+    /// For each berm cell outside the base station's coverage, its borrow cell.
+    pub borrow: Vec<Option<Borrow>>,
+    /// Most payload room a digger can have, kg: borrow digs are sized so the
+    /// overflow covers the berm's need even when the payload is empty.
+    dig_room_kg: f64,
     /// Material ledger.
     pub material: Material,
     rework: BTreeSet<(u32, u32)>,
@@ -247,8 +278,23 @@ impl Planner {
                 confirmed: false,
             })
             .collect();
-        let berm_cells: Vec<GridCoord> = berm.iter().map(|b| b.at).collect();
-        let material = Material::new(&area, &berm_cells, world, cfg);
+        // Borrow digs need a digger; without one the berm is hauled as usual.
+        let borrow = if reg.capable(CapabilityName::Dig).is_empty() {
+            vec![None; berm.len()]
+        } else {
+            borrow_cells(&area, &berm, world, cfg)
+        };
+        let blocked: Vec<GridCoord> = berm
+            .iter()
+            .map(|b| b.at)
+            .chain(borrow.iter().flatten().map(|b| b.at))
+            .collect();
+        let material = Material::new(&area, &blocked, world, cfg);
+        let dig_room_kg = reg
+            .capable(CapabilityName::Dig)
+            .iter()
+            .map(|&r| reg.haul_capacity_kg(r))
+            .fold(0.0, f64::max);
         Self {
             goal_id: goal_id.into(),
             pad: spec,
@@ -257,6 +303,8 @@ impl Planner {
             sections,
             section_of,
             berm,
+            borrow,
+            dig_room_kg,
             material,
             rework: BTreeSet::new(),
             strict: BTreeSet::new(),
@@ -423,6 +471,7 @@ impl Planner {
                 max_kg,
                 elevation_m: target,
                 section: Some(section),
+                cast_to: None,
             };
             if st.dig {
                 out.push(task(Stage::Dig, world.site.dig_units_m3(c, target), 0.0));
@@ -532,6 +581,14 @@ impl Planner {
                 } else {
                     (n + i) as f64
                 };
+                match self.borrow_dig(world, i, need, seq, busy, cfg) {
+                    BorrowDig::Ready(task) => {
+                        out.push(task);
+                        continue;
+                    }
+                    BorrowDig::Busy => continue,
+                    BorrowDig::Unavailable => {}
+                }
                 out.push(Task {
                     key: TaskKey::Cell(Stage::Berm, b.at.x, b.at.y),
                     stage: Stage::Berm,
@@ -541,6 +598,7 @@ impl Planner {
                     max_kg: f64::INFINITY,
                     elevation_m: 0.0,
                     section: None,
+                    cast_to: None,
                 });
             } else if !b.confirmed && b.deposited_kg > 0.0 {
                 to_check.push(b.at);
@@ -560,6 +618,55 @@ impl Planner {
     }
 
     /// Progress as the world model sees it.
+    /// The next dig from berm cell `i`'s borrow cell: deep enough that the
+    /// overflow covers `need_kg` even with an empty payload, never below the
+    /// borrow cell's floor.
+    fn borrow_dig(
+        &self,
+        world: &WorldModel,
+        i: usize,
+        need_kg: f64,
+        seq: f64,
+        busy: &Busy,
+        cfg: &Config,
+    ) -> BorrowDig {
+        let Some(b) = self.borrow.get(i).copied().flatten() else {
+            return BorrowDig::Unavailable;
+        };
+        if busy.cell(b.at) {
+            return BorrowDig::Busy;
+        }
+        let site = &world.site;
+        let (Some(elev), Some(floor)) = (site.get(b.at).and_then(|k| k.elevation()), b.floor_m)
+        else {
+            return BorrowDig::Unavailable;
+        };
+        let depth = (need_kg + self.dig_room_kg) / (site.density(b.at, cfg) * site.cell_area_m2());
+        let target = (elev - depth).max(floor);
+        if elev - target < 0.05 {
+            return BorrowDig::Unavailable;
+        }
+        BorrowDig::Ready(Task {
+            key: TaskKey::Cell(Stage::Dig, b.at.x, b.at.y),
+            stage: Stage::Dig,
+            area: geom::unit(b.at),
+            seq,
+            amount: site.dig_units_m3(b.at, target),
+            max_kg: 0.0,
+            elevation_m: target,
+            section: None,
+            cast_to: Some(self.berm[i].at),
+        })
+    }
+
+    /// Whether berm cell `i` is fed from its borrow cell (which still has material).
+    fn fed_by_borrow(&self, world: &WorldModel, i: usize) -> bool {
+        self.borrow.get(i).copied().flatten().is_some_and(|b| {
+            let elev = world.site.get(b.at).and_then(|k| k.elevation());
+            matches!((elev, b.floor_m), (Some(e), Some(f)) if e - f >= 0.05)
+        })
+    }
+
     pub fn progress(&self, world: &WorldModel, cfg: &Config) -> Progress {
         let mut p = Progress {
             pad_cells: self.order.len(),
@@ -654,7 +761,10 @@ impl Planner {
                     .site
                     .mass_for_height(b.at, spec_height + cfg.berm_margin_m, cfg)
             };
-            if need > 0.0 {
+            if need > 0.0 && self.fed_by_borrow(world, i) {
+                let m3 = need / (world.site.density(b.at, cfg) * cell_area);
+                add(CapabilityName::Dig, m3, 1.0, cs, 1.0);
+            } else if need > 0.0 {
                 add(
                     CapabilityName::Haul,
                     need,
@@ -762,6 +872,15 @@ impl Planner {
 
     /// Update berm bookkeeping after scan results were applied to the site.
     pub fn after_scan(&mut self, world: &WorldModel, cells: &[CellObservation], cfg: &Config) {
+        // A borrow cell's floor follows from its first measured elevation.
+        for b in self.borrow.iter_mut().flatten() {
+            if b.floor_m.is_none()
+                && cells.iter().any(|o| o.at == b.at)
+                && let Some(e) = world.site.get(b.at).and_then(|k| k.elevation())
+            {
+                b.floor_m = Some(e - cfg.berm_borrow_max_depth_m);
+            }
+        }
         let Some(height) = self.pad.berm.as_ref().map(|b| b.height_m) else {
             return;
         };
@@ -915,6 +1034,72 @@ impl Planner {
     }
 }
 
+/// A borrow cell for each berm cell outside the base station's coverage: the
+/// nearest cell within side-cast reach that is covered and is not pad, berm,
+/// infrastructure or another berm cell's borrow cell.
+fn borrow_cells(
+    pad: &GridRect,
+    berm: &[BermCell],
+    world: &WorldModel,
+    cfg: &Config,
+) -> Vec<Option<Borrow>> {
+    let site = &world.site;
+    let cov = Coverage::new(&world.base_station, site.cell_size_m, &[]);
+    let reach = cfg.side_cast_reach_m / site.cell_size_m;
+    let mut taken: BTreeSet<(u32, u32)> = berm.iter().map(|b| (b.at.x, b.at.y)).collect();
+    for p in world
+        .stations
+        .iter()
+        .map(|s| s.position)
+        .chain(world.depots.iter().map(|d| d.position))
+    {
+        taken.insert((p.x, p.y));
+    }
+    let r = reach.floor() as i64;
+    berm.iter()
+        .map(|b| {
+            if cov.base_covers(b.at) {
+                return None;
+            }
+            let mut best: Option<(f64, u32, u32)> = None;
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let (x, y) = (i64::from(b.at.x) + dx, i64::from(b.at.y) + dy);
+                    if x < 0 || y < 0 {
+                        continue;
+                    }
+                    let c = GridCoord {
+                        x: x as u32,
+                        y: y as u32,
+                    };
+                    let d = geom::dist(b.at, c);
+                    if !site.in_bounds(c)
+                        || d > reach
+                        || geom::contains(pad, c)
+                        || taken.contains(&(c.x, c.y))
+                        || !cov.base_covers(c)
+                    {
+                        continue;
+                    }
+                    if best.is_none_or(|k| (d, c.y, c.x) < k) {
+                        best = Some((d, c.y, c.x));
+                    }
+                }
+            }
+            let (_, y, x) = best?;
+            let at = GridCoord { x, y };
+            taken.insert((x, y));
+            Some(Borrow {
+                at,
+                floor_m: site
+                    .get(at)
+                    .and_then(|k| k.elevation())
+                    .map(|e| e - cfg.berm_borrow_max_depth_m),
+            })
+        })
+        .collect()
+}
+
 fn scan_task(key: TaskKey, stage: Stage, area: GridRect, seq: f64, cell_area: f64) -> Task {
     Task {
         key,
@@ -925,6 +1110,7 @@ fn scan_task(key: TaskKey, stage: Stage, area: GridRect, seq: f64, cell_area: f6
         max_kg: 0.0,
         elevation_m: 0.0,
         section: None,
+        cast_to: None,
     }
 }
 

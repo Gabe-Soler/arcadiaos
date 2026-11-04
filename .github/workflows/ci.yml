@@ -7,10 +7,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # ArcadiaBench revision the integration job runs against: pinned to the
-  # week-5 simulator (faults, wear, repair options and energy modes; protocol
-  # v0.2.0) that this coordinator speaks. The integration tests run the
-  # `nominal` variant.
-  BENCH_REF: 6f4e1b2bb304352a094b77b21456738e70845dbc
+  # week-6 simulator (the Earth link with light-time delay, outages and the
+  # conjunction blackout; authority enforcement; site coverage and relays;
+  # protocol v0.2.0) that this coordinator speaks. The integration tests run
+  # the `nominal` and `conjunction` variants.
+  BENCH_REF: 7c41a9210d66496e7f8b6f7b9045a3775c3a112e
 
 jobs:
   check:

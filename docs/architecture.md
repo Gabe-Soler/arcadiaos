@@ -1,6 +1,6 @@
 # ArcadiaOS architecture
 
-ArcadiaOS is the coordinator: it turns Earth's goal into work for a crew of robots and keeps that work on track. This document describes the v1 core delivered in roadmap weeks 3–4 (world model, capability registry, planner, allocation, scheduling, energy policy and executor) and the week-5 additions: fault response, predictive maintenance and energy-aware scheduling. It also notes the seams week 6 builds on.
+ArcadiaOS is the coordinator: it turns Earth's goal into work for a crew of robots and keeps that work on track. This document describes the v1 core delivered in roadmap weeks 3–4 (world model, capability registry, planner, allocation, scheduling, energy policy and executor), the week-5 additions (fault response, predictive maintenance and energy-aware scheduling) and the week-6 additions: the authority layer, Earth messages, blackout behaviour and coverage-aware planning.
 
 ## Principles
 
@@ -14,21 +14,23 @@ ArcadiaOS is the coordinator: it turns Earth's goal into work for a crew of robo
 
 `run(input, output)` handles the session: version handshake, then one decision per observation, then `end`. For each observation the [`Coordinator`](../src/coordinator.rs) does the following:
 
-1. Takes in the robot states, then the events in order: command outcomes, scan results, faults, power, weather and comms reports, and Earth messages. The landing-pad goal arrives as an Earth message and creates the plan. Health telemetry updates the wear estimates, power reports update the bank forecast, and each robot's performance factors are refreshed.
-2. Refreshes the capacity plan when the remaining work, the set of working robots, or a robot's faults have changed.
+1. Takes in the robot states, then the events in order: command outcomes, scan results, faults, power, weather and comms reports, and Earth messages. The landing-pad goal arrives as an Earth message and creates the plan; approvals, vetoes, reprioritisation and policy updates take effect as they arrive. Health telemetry updates the wear estimates, power reports update the bank forecast, and each robot's performance factors are refreshed.
+2. Works out the covered part of the site, and refreshes the capacity plan when the remaining work, the set of working robots, or a robot's faults have changed.
 3. Derives the ready tasks from the plan.
-4. Recovers disabled robots: service or charge in place, field repair, tow, or a mobile charger brought over.
+4. Recovers disabled robots: service or charge in place, field repair, tow, a mobile charger brought over, or parts from a donor (asking Earth first; see [Authority](#authority-and-earth)).
 5. Starts maintenance that is pressing enough not to wait for a natural break.
-6. Sends robots below their energy low-water mark to charge (or brings a mobile charger to them).
-7. Runs the auction over free robots, plus robots whose current job may be interrupted.
-8. Gives leftover robots maintenance at this natural break, a charge (when work waits on energy), an opportunistic top-up, a parking charge for the night, or a move towards upcoming work.
-9. Requests a `wake_at` while anything waits on time: a retry back-off ending, an idle or disabled robot, or nothing in flight.
+6. Stations a relay, or stands one down, where coverage needs it.
+7. Sends robots below their energy low-water mark to charge (or brings a mobile charger to them).
+8. Runs the auction over free robots, plus robots whose current job may be interrupted.
+9. Gives leftover robots maintenance at this natural break, a charge (when work waits on energy), an opportunistic top-up, a parking charge for the night, or a move towards upcoming work.
+10. Reports to Earth: a `notify` for the decision's level-2 commands, approval requests, and a status report when one is due.
+11. Requests a `wake_at` while anything waits on time: a retry back-off ending, an idle or disabled robot, an approval deadline, or nothing in flight.
 
 ## Modules
 
 | Module | Responsibility |
 |---|---|
-| `world` | World model: per-cell site knowledge (`world::site`), the crew (`world::fleet`), stations, depots, power, weather, comms and the policy in force. |
+| `world` | World model: per-cell site knowledge (`world::site`), the crew (`world::fleet`), stations, depots, the base station, power, weather, the Earth link and the policy in force. |
 | `registry` | Capability registry: who can do what, at what rate and energy per unit, haul and charger capacities, and the travel and work cost models built on them. |
 | `planner` | Goal → task graph: sections and sweep order, per-cell readiness, berm, verification batching, rework and the recheck loop. `planner::material` keeps the cut/fill ledger: stockpile siting, spoil casting, haul sources and borrow. |
 | `tasks` | Task and stage types shared by the planner, allocator and executor. |
@@ -37,7 +39,9 @@ ArcadiaOS is the coordinator: it turns Earth's goal into work for a crew of robo
 | `energy` | Reserves, affordability, charge targets, station queues, mobile chargers and rescue. |
 | `power` | The site bank forecast (fission, half-sine solar scaled by measured dust transmittance, essential load, scheduled charging) and the assumed cold-night window. |
 | `health` | Smoothed health telemetry, usage since the last maintenance, wear estimates, performance factors and the predictive-maintenance rule. |
-| `recovery` | The next recovery step for a stuck, failed or offline robot, costed and gated by the authority policy. |
+| `recovery` | The next recovery step for a stuck, failed or offline robot, costed and gated by the authority layer. |
+| `authority` | The level of every action under the policy in effect, approval requests and Earth's answers, the level-3 fallback rule, notifies and status reports. |
+| `coverage` | Which cells the base station and holding relays cover; scan areas entered from a covered cell. |
 | `executor` | Command lifecycle: deterministic ids, accepted, completed, failed or rejected, back-off, cancellation, and which robots in-flight commands engage. |
 | `coordinator` | One decision per observation, tying the rest together. |
 | `config` | Every assumption and tuning knob in one place. |
@@ -91,7 +95,7 @@ The pad is swept boustrophedon-style, starting from the corner nearest the crew,
 
 ### Material balance
 
-- **Stockpiles** are cells in a ring just outside the pad, never berm, station or depot cells, each allowed to rise a limited height.
+- **Stockpiles** are cells in a ring just outside the pad, never berm, borrow, station or depot cells, inside the base station's coverage when there are enough such cells, each allowed to rise a limited height.
 - **Dig spoil** fills the digger's own payload first. The overflow goes to the destination chosen for that dig:
   - a berm cell within a short reach that still needs material;
   - otherwise a fill cell within reach whose need matches the expected overflow. The cell is rescanned afterwards, because the amount is an estimate;
@@ -103,7 +107,7 @@ The pad is swept boustrophedon-style, starting from the corner nearest the crew,
 
 ### Berm
 
-Berm cells are surveyed first, to learn their base elevation and density. Hauls and spoil then raise them to the specified height plus a margin, sized with a density safety factor. A scan after the last deposit confirms each cell; a short cell gets more material.
+Berm cells are surveyed first, to learn their base elevation and density. Hauls and spoil then raise them to the specified height plus a margin, sized with a density safety factor; a berm cell outside the base station's coverage is fed instead by digs at its borrow cell, inside coverage, casting their spoil onto it (see [Coverage](#coverage)). A scan after the last deposit confirms each cell; a short cell gets more material.
 
 ### Verification, rework and recheck
 
@@ -149,7 +153,7 @@ score = travel time
 - **A pure auction has no global view of roles.** Without the plan, a multi-capability robot is tempted by work another robot does better, starving its own speciality. The linear program supplies that view cheaply and explainably.
 - **A pure MILP is the wrong tool for dispatch.** The interesting decisions are made one command at a time, as events arrive, with surprises. A MILP over the whole schedule would have to be re-solved at nearly every decision, could not meet a per-decision time budget for 20 robots and hundreds of tasks, and needs a solver. The good MILP solvers need C++ toolchains, and the pure-Rust options pull in a dozen crates.
 - **Hungarian assignment** solves one round optimally, but there are usually one or two free robots per decision, so a greedy auction matches it in practice. The auction also handles conflicts (one command per cell) and per-robot plans naturally.
-- **The auction is CBAA-style.** Consensus-based bundle auctions are designed to run distributed. When comms constraints arrive (week 6), robots or sub-crews can bid locally with the same scoring.
+- **The auction is CBAA-style.** Consensus-based bundle auctions are designed to run distributed, so robots or sub-crews out of contact could bid locally with the same scoring.
 
 ## Scheduling
 
@@ -196,7 +200,87 @@ Each candidate is costed in seconds until the robot is back:
 
 The cheapest permitted option wins; ties go to the lower helper index. Helpers are free robots or robots on interruptible jobs. A helper that cannot afford the step is sent to charge for it. While a mobile charger is on its way, the robot waits for it. Engaged robots (being repaired or towed, or a charger in use) are never offered other commands.
 
-**Authority.** Every option names the policy action it uses, and `recovery::permitted` gates it. Today that allows levels 1 and 2, so `tow` (level 2 in the default policy) is used and `cannibalize` (level 3) is not. A donor must be disabled and redundant: every capability it has, another working robot also has. Week 6 replaces the gate with the approval flow: a level-3 option becomes an approval request, with the best permitted option as the fallback, and level-2 actions get their `notify`.
+**Authority.** Every option names the policy action it uses, and the authority layer gates it: levels 1 and 2 are taken (`tow`, level 2 in the default policy, gets its `notify`), higher levels only with an approval in hand. A donor for cannibalizing must be disabled and redundant: every capability it has, another working robot also has. When parts from a donor would beat every allowed option, ArcadiaOS asks Earth and holds the robot for the answer; see [Authority and Earth](#authority-and-earth).
+
+## Authority and Earth
+
+[`authority`](../src/authority.rs) keeps the books; the coordinator routes every action through it.
+
+**The policy in effect** is the scenario's, replaced by each `policy_update` the moment it arrives. Every action has a level under it:
+
+| Level | What ArcadiaOS does |
+|---|---|
+| 1 | Takes the action. |
+| 2 | Takes it, and sends a `notify` listing the command ids in the same decision: one notify per action per decision, so none is ever late and the downlink carries only what policy asks for. |
+| 3 | Asks with an `approval_request` carrying a `decide_by_t` and a `fallback` from the level-3 rule below, then acts on `approve`, or, once the deadline has passed with no answer, on the fallback. The command cites the request as its `approval_id`. |
+| 4 | Asks, and acts only on `approve`. Never autonomously, even in a blackout. |
+
+Approvals are scoped to their purpose: an approval to strip one donor for one robot is used only for that, although the simulator would accept it for any `cannibalize`.
+
+**Robot commands.** In the default policy every command is level 1 except `tow` (2) and `cannibalize` (3). If a policy puts a routine command (driving, scanning, digging, charging, …) at level 3 or 4, ArcadiaOS stops issuing it and asks Earth for a standing approval for the rest of that policy version, with low stakes (proceed on the fallback at level 3).
+
+**Coordinator-level actions** cannot be enforced by the simulator, but go through the same levels:
+
+- `replan`: re-solving the capacity plan because the set of working robots changed (a robot disabled, back, or lost). Notified at level 2; at levels 3 and 4 the old plan stands until Earth agrees.
+- `reassign_task`: a task released by a robot that was disabled during it, offered to the others. Notified at level 2; at levels 3 and 4 the task is held for its robot until Earth agrees.
+- `commit_energy_reserve`: station charging that draws on the bottom quarter of the site bank (`bank_floor_frac`) while the bank is that low. At level 2 it is notified once per episode; at levels 3 and 4 such charging waits for Earth's approval (charging the current supply can cover still goes ahead).
+- `abandon_section`: ArcadiaOS never abandons a section.
+
+### The level-3 fallback rule
+
+The outline names this the core research problem: weighing the cost of waiting against the cost of being wrong. ArcadiaOS prices both in seconds of crew time:
+
+```text
+expected = time until the link is up + 2 × one-way delay + Earth's response time
+wait     = min(margin × expected, max_wait_s)  if expected ≤ max_wait_s,  else 0
+net      = benefit − wait × wait_cost
+ask        only if net > 0
+fallback = proceed if net > risk, else abort
+```
+
+- **Waiting is worth it only if an answer can come in time.** The expected answer time uses the latest `comms` report: the one-way delay, and when the link is down, `expected_restore_t` if the site knows it (a conjunction), else never (an outage). If Earth cannot answer within the policy's `max_wait_s`, ArcadiaOS does not wait pointlessly: the request goes out with `decide_by_t` now, and the fallback decides at the next decision.
+- **A request that changes nothing is not sent**: no time to wait and fallback abort.
+- **For cannibalizing**, `benefit` is the time the robot is back sooner than by the best allowed option (towing to a depot and servicing, a field repair, …; a sol when nothing else can bring it back), `wait_cost` is the robot's weight (its capacity-plan utilisation, at least 0.2: a bottleneck's hour costs the crew an hour), and `risk` is `cannibalize_risk_s`, the expected cost of stripping a robot Earth would rather keep. At level 4 only an approval counts, so ArcadiaOS asks only when an answer can come within `max_wait_s`, and otherwise takes the best allowed option.
+- **Routine actions** at level 3 have no risk to speak of, so their fallback is proceed.
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| `earth_response_s` | 1200 s | Mission control's typical response time (interface assumption). |
+| `answer_margin` | 1.5 | Waiting stretches to 1.5 × the expected answer time, within `max_wait_s`. |
+| `cannibalize_risk_s` | 21,600 s | A robot lost for good: six hours of crew time. |
+| `no_alternative_s` | 88,775 s | What cannibalizing gains when nothing else can bring the robot back: a sol. |
+| `routine_benefit_s` | 14,400 s | What a standing approval of a routine action is worth. |
+| `assumed_delay_s` | 720 s | One-way delay before the first `comms` report. |
+
+At the default delay of 720 s an answer is expected in 2640 s, within the default policy's hour, so ArcadiaOS waits up to the hour. In the `conjunction` variant the delay is near 1440 s, an answer would take over an hour, and the rule decides at once even while the link is up.
+
+### Earth messages, reports and blackouts
+
+- **`goal`** creates the plan; **`policy_update`** replaces the policy in effect when it arrives (the reference simulator's trust script loosens `tow`, `replan` and `reassign_task` to level 1 after two incident-free sols, and tightens `cannibalize` to level 4 after a robot is lost); **`approve`** and **`veto`** settle requests, and after a veto ArcadiaOS takes the best allowed option instead; **`reprioritize`** is recorded (there is one goal, so nothing else changes).
+- **Status reports** go out with the plan at the start, about once a sol (`status_period_s`), and after major events (a robot lost, a policy update), with the pad's progress and the state of the crew.
+- **Blackouts and outages** do not stall the crew: nothing in the default policy waits on Earth, level-3 requests go straight to the fallback rule, level-2 notifies are sent as usual (the link stores and forwards them), and periodic status reports are held while the link is down and caught up with one report when it returns.
+
+## Coverage
+
+[`coverage`](../src/coverage.rs) works out which cells can hear the site: within the base station's range, or within the range of a relay ArcadiaOS has holding at its position that is itself covered, transitively. Each robot's snapshot says whether the site can hear it right now.
+
+- **Robots out of contact are never commanded.** Their snapshots are stale (`telemetry_t` is when contact was lost), so they are neither free, nor helpers, nor recovery targets; their jobs stay in flight, and their events, delivered late with their original times, settle those jobs when they return. A rejection `out_of_coverage` backs the robot off.
+- **Work is kept inside coverage.**
+  - A scan whose entry cell (the area's cell nearest the robot) is out of coverage is grown a few rows or columns toward coverage, so the robot scans from a covered cell.
+  - Stockpile sites are chosen inside the base station's coverage when there are enough such cells, so loading never takes a hauler out of contact.
+  - A berm cell outside coverage is built from a **borrow cell**: the nearest covered cell within side-cast reach (not pad, berm or infrastructure). Digs there cast their spoil straight onto the berm cell, deep enough to cover its need even with an empty payload, down to `berm_borrow_max_depth_m`; a dug-out borrow cell hands the berm back to hauling.
+- **Work that must leave coverage is costed.** A bid ending out of coverage carries the lost-link wait (`lost_link_timeout_s`, after which the simulator drives an idle robot back) in its duration and its score, so covered work wins.
+- **Relays.** When ready work (or a robot out of contact well past its expected return, `stranded_margin_s`) needs coverage the base station cannot give, ArcadiaOS stations a relay-capable free robot at the covered cell that serves the most of it with the shortest drive, if the robot time saved is at least `relay_benefit_ratio` times what the relay robot gives up (its utilisation times the time it holds). It stands the relay down when nothing needs it, or when the relay robot runs low. The relay draws `relay_radio_w` on top of idle power.
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| `lost_link_timeout_s` | 1800 s | When the simulator drives an idle robot out of coverage back (interface assumption). |
+| `relay_radio_w` | 25 W | A holding relay's radio draw (interface assumption). |
+| `berm_borrow_max_depth_m` | 1.5 m | Deepest a borrow cell is dug. |
+| `relay_benefit_ratio` | 1.5 | Saving needed per second a relay costs. |
+| `stranded_margin_s` | 1800 s | Out of contact this long past its expected return: stranded. |
+
+On ArcadiaBench's `landing-pad-small` the base station covers the pad but not the berm. Week 5's coordinator built the berm by hauling onto it and scanning it from its own row, so the scout, hauler and excavator spent about 18 robot-hours a run out of contact waiting for lost-link returns. Now the berm is built from the row of borrow cells just south of it, and berm scans are entered from that row: no robot leaves coverage, and the relay is never needed.
 
 ## Health and predictive maintenance
 
@@ -244,6 +328,7 @@ Commands get deterministic ids (`os-000001`, …). The executor tracks each one 
 | Rejected `invalid_target` / failed `blocked` | Mark the cell stale (rescan before more work); back off that task on that robot. Refused grades tighten the cell's window. A haul that found nothing to load stops counting on that pile. |
 | Rejected `missing_capability` | Disable the capability for that robot and re-plan roles. |
 | Rejected `busy`, `robot_disabled`, `out_of_coverage` | Back off the robot briefly. |
+| Rejected `approval_required`, `vetoed` | Back off the task; the authority layer means this does not happen. |
 | Rejected `unknown_robot` | Drop the robot from planning. |
 | Failed `insufficient_energy` | Back off; the energy policy prevents this in practice. |
 | Failed `cancelled` | Expected after a cancellation; nothing to do. |
@@ -261,12 +346,32 @@ ArcadiaOS never issues a command that would complete instantly, such as a move t
 
 ## Testing
 
-- **Unit tests next to each module:** geometry, site knowledge, registry and performance factors, simplex, capacity plan, planner, material ledger, energy, allocator, executor, health (smoothing, wear, calibration, the maintenance rule), power (forecast, deferral, surplus, cold window) and recovery (every step and the authority gate).
-- **Coordinator tests:** tow to the depot then service in place, charge in place at a station, a mobile charger for an offline robot, repair of a stuck and failed robot, parking charged before the night, a mobile charger driving to a slow robot, and lost robots never commanded.
+- **Unit tests next to each module:** geometry, site knowledge, registry and performance factors, simplex, capacity plan, planner (including berm borrow cells), material ledger, energy, allocator (including covered scan entries and costed stranding), executor, health (smoothing, wear, calibration, the maintenance rule), power (forecast, deferral, surplus, cold window), recovery (every step, donors and the authority hooks), authority (the level-3 rule, approvals, fallbacks and vetoes, notifies, status reports) and coverage (transitive relays, scan areas).
+- **Coordinator tests:** tow to the depot then service in place, charge in place at a station, a mobile charger for an offline robot, repair of a stuck and failed robot, parking charged before the night, a mobile charger driving to a slow robot, lost robots never commanded, a level-2 tow notified in the same decision, a policy update applied on arrival, cannibalizing asked about and done on approval (and not on a veto), the fallback deciding at once in a blackout (and nothing done at level 4), robots out of contact never commanded, and a relay stationed for work beyond coverage.
 - **`tests/crews.rs`:** synthetic scenarios on a small deterministic simulator written from the interface semantics. It covers crews of 3, 4, 5, 10 and 20 robots, generalists, mixed and overlapping capability sets, several stations, fifth-size batteries and a crew with no hauler. A mobile charger beats a weak, distant station, and a robot stranded too far from any charger is rescued by one. It also checks determinism and the per-decision time.
 - **`tests/robustness.rs`:** hostile rejections, malformed but valid goals, unknown robots and commands, no stations and immobile robots.
 - **`tests/session.rs`:** the real binary over stdio. It covers the handshake, version errors, planning once the goal arrives, back-off after a rejection, and silence by default.
-- **`tests/bench.rs`:** the real binary under ArcadiaBench (`nominal` variant), when `ARCADIABENCH` is set. Seeds 1–3 must finish `goals_complete` with no robot lost (metrics are read from `run_end`), and the same seed twice must give byte-identical logs.
+- **`tests/bench.rs`:** the real binary under ArcadiaBench (`nominal` and `conjunction` variants), when `ARCADIABENCH` is set. Seeds 1–3 of each must finish `goals_complete` with no robot lost, no policy violation, no `approval_required` or `out_of_coverage` rejection and at least one status report (metrics are read from `run_end`), and the same seed twice must give byte-identical logs.
+
+## Results (ArcadiaBench week 6, `landing-pad-small`)
+
+Measured against ArcadiaBench `7c41a92` in release, from each log's `run_end.metrics`:
+
+| Variant | Completed | Sols (mean, min–max) | Policy violations | Notifies | Status reports | Approval requests | Robot time out of coverage |
+|---|---|---|---|---|---|---|---|
+| `nominal`, seeds 1–20 | 20 / 20 | 0.806, 0.788–0.880 | 0 | 14 | 20 | 0 | 0 s |
+| `conjunction`, seeds 1–20 | 20 / 20 | 0.806, 0.788–0.880 | 0 | 14 | 20 | 0 | 0 s |
+| `cascading_faults`, seeds 1–20 | 20 / 20 | 0.876, 0.856–0.944 | 0 | 71 | 20 | 0 | 3 s |
+| `solar_only`, seeds 1–10 | 10 / 10 | 0.799, 0.792–0.807 | 0 | 4 | 10 | 0 | 0 s |
+| `nuclear_heavy`, seeds 1–10 | 10 / 10 | 0.799, 0.788–0.808 | 0 | 4 | 10 | 0 | 0 s |
+
+- No command was rejected (no `approval_required`, `vetoed` or `out_of_coverage`), no robot was lost, and runs are byte-identical across repeats.
+- Notifies report every `tow`, `replan` and `reassign_task`; each run fits in under a sol, so it sends one status report.
+- No run cannibalized: in the four-robot crew no robot is redundant, so there is never a donor. The approval flow is covered by the coordinator tests.
+- The 3 s is one excavator drive between two borrow cells that clips a cell just outside coverage.
+- The week-5 coordinator, run against the same simulator, finished `nominal` and `conjunction` seeds 1–10 in 0.802 sols on average with one violation each (a `tow` with no notify), its robots out of contact for hours a run. Week 6 takes 0.799 on both.
+
+Decisions take about 0.03 ms on average and about 0.1 ms at most.
 
 ## Results (ArcadiaBench week 5, `landing-pad-small`)
 
@@ -299,11 +404,11 @@ The run is bound by the single compactor-sinterer, which is busy essentially all
 
 ## Extension points
 
-### Week 6: authority, Earth and comms
+### After week 6
 
-- **Authority gate.** Every command passes through one place (`Executor::issue`, called from `State::dispatch`). An authority gate there can check `policy.level_for(action)`, attach approvals, queue level-3 and level-4 actions, and record what level-2 actions must be notified. Recovery options already name their policy action and pass through `recovery::permitted`: replacing that gate with the approval flow lets `cannibalize` be requested, and `tow` (level 2) needs its `notify`.
-- **Earth messages.** They arrive in `State::on_uplink`: policy updates are already applied there; approvals, vetoes and reprioritisation belong there too. Messages to Earth go in `Decision::to_earth`, empty today.
-- **Comms and coverage.** Comms reports are kept in the world model. Coverage-aware planning can treat out-of-coverage robots as unavailable to new commands, and add relay positioning as a planner task.
+- **Approvals.** New level-3 actions plug into `State::weigh_cannibalize` (its stakes) or `State::ask_earth` (generic), and are cited from `Authority::authorization`.
+- **Coverage.** Relay placement is a heuristic over covered cells; a crew with several relays, or sites mostly out of coverage, could plan relay chains.
+- **Distributed allocation.** The auction is CBAA-style, so sub-crews out of contact could bid locally with the same scoring.
 
 ## Tuning
 
@@ -316,6 +421,8 @@ All assumptions and knobs live in `Config` (`src/config.rs`). They cover:
 - tow, service and repair assumptions;
 - the health model (telemetry coefficients, nominal wear rates, the hazard, wear and degraded-fault effects);
 - maintenance thresholds;
-- the cold window, parking horizon and bank thresholds.
+- the cold window, parking horizon and bank thresholds;
+- Earth and authority: the response time, the answer margin, the risk and benefit prices of the level-3 rule, and the status period;
+- coverage: the lost-link timeout, relay radio power, borrow depth, relay benefit ratio and stranding margin.
 
-The health and repair numbers are interface assumptions taken from the reference simulator's documentation. ArcadiaOS uses them to rank options, and corrects energy and time estimates from what it measures. None is specific to a seed, a crew or a site.
+The health, repair, Earth response, lost-link and relay numbers are interface assumptions taken from the reference simulator's documentation. ArcadiaOS uses them to rank options, and corrects energy and time estimates from what it measures. None is specific to a seed, a crew or a site.

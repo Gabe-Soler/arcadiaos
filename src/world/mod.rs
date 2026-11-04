@@ -4,14 +4,16 @@
 //! - [`site`]: per-cell knowledge (prior, scans with timestamps, modelled
 //!   surface state and elevation).
 //! - [`fleet`]: robot specs and latest states.
-//! - Infrastructure (stations, depots), the site power and weather reports,
-//!   the comms link, and the authority policy in force.
+//! - Infrastructure (stations, depots, the comms base station), the site
+//!   power and weather reports, the Earth link, and the authority policy in
+//!   force.
 
 pub mod fleet;
 pub mod site;
 
 use arcadia_protocol::{
-    ChargeStation, CommsCause, Depot, Event, EventKind, Link, Policy, Scenario, WeatherCondition,
+    BaseStation, ChargeStation, CommsCause, Depot, Event, EventKind, Link, Policy, Scenario,
+    WeatherCondition,
 };
 use fleet::Fleet;
 use site::SiteKnowledge;
@@ -59,6 +61,8 @@ pub struct CommsStatus {
     pub cause: CommsCause,
     /// One-way light time, s.
     pub one_way_delay_s: f64,
+    /// When the link is expected back, if it is down and the site knows.
+    pub expected_restore_t: Option<f64>,
 }
 
 /// Everything ArcadiaOS believes about the world.
@@ -78,9 +82,11 @@ pub struct WorldModel {
     pub fleet: Fleet,
     /// Charging stations.
     pub stations: Vec<ChargeStation>,
-    /// Maintenance depots (used from week 5).
+    /// Maintenance depots.
     pub depots: Vec<Depot>,
-    /// Authority policy in force (enforced from week 6).
+    /// The site comms hub: robots in its range (or a relay's) can be commanded.
+    pub base_station: BaseStation,
+    /// Authority policy in force: the scenario's, replaced by each policy update.
     pub policy: Policy,
     /// Latest power report.
     pub power: Option<PowerStatus>,
@@ -102,6 +108,7 @@ impl WorldModel {
             fleet: Fleet::new(&scenario.robots),
             stations: scenario.stations.clone(),
             depots: scenario.depots.clone(),
+            base_station: scenario.base_station.clone(),
             policy: scenario.policy.clone(),
             power: None,
             weather: None,
@@ -146,17 +153,28 @@ impl WorldModel {
                 link,
                 cause,
                 one_way_delay_s,
-                ..
+                expected_restore_t,
             } => {
                 self.comms = Some(CommsStatus {
                     t: e.t,
                     link: *link,
                     cause: *cause,
                     one_way_delay_s: *one_way_delay_s,
+                    expected_restore_t: *expected_restore_t,
                 });
             }
             _ => {}
         }
+    }
+
+    /// Whether the Earth link is up, as last reported (up before any report).
+    pub fn link_up(&self) -> bool {
+        self.comms.as_ref().is_none_or(|c| c.link == Link::Up)
+    }
+
+    /// One-way light time to Earth, as last reported, s.
+    pub fn one_way_delay_s(&self, assumed_s: f64) -> f64 {
+        self.comms.as_ref().map_or(assumed_s, |c| c.one_way_delay_s)
     }
 
     /// Expected fraction of rated station power actually delivered: 1 unless

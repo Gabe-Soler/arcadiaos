@@ -64,13 +64,18 @@ pub enum Job {
         /// Maintenance of a working robot rather than recovery of a disabled one.
         preventive: bool,
     },
-    /// Strip a disabled robot for parts to restore another. Only issued when
-    /// the policy allows it without Earth's approval.
+    /// Strip a disabled robot for parts to restore another, with the
+    /// approval the policy requires.
     Cannibalize {
         /// The robot stripped (lost afterwards).
         target: usize,
         /// The robot that receives the parts.
         beneficiary: usize,
+    },
+    /// Drive to a cell and hold there as a comms relay until cancelled.
+    Relay {
+        /// Where it holds.
+        at: GridCoord,
     },
 }
 
@@ -133,6 +138,7 @@ impl Job {
                 target,
                 beneficiary,
             } => format!("cannibalize robot #{target} for robot #{beneficiary}"),
+            Job::Relay { at } => format!("relay at ({},{})", at.x, at.y),
         }
     }
 
@@ -149,7 +155,9 @@ impl Job {
                 crate::energy::ChargeSource::Mobile(c) => vec![c],
                 crate::energy::ChargeSource::Station(_) => vec![],
             },
-            Job::Work { .. } | Job::Move { .. } | Job::Service { .. } => vec![],
+            Job::Work { .. } | Job::Move { .. } | Job::Service { .. } | Job::Relay { .. } => {
+                vec![]
+            }
         }
     }
 }
@@ -553,6 +561,7 @@ mod tests {
             max_kg: 0.0,
             elevation_m: 0.0,
             section: Some(0),
+            cast_to: None,
         }
     }
 
@@ -571,6 +580,7 @@ mod tests {
                 energy_wh: 8.0,
                 haul: None,
                 dig: None,
+                strands: false,
             }),
         }
     }

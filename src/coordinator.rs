@@ -8,25 +8,31 @@
 //! 1. refresh the capacity plan when the work or the fleet has changed;
 //! 2. derive the ready tasks from the plan (dependency order per cell);
 //! 3. recover disabled robots: service or charge in place, field repair,
-//!    tow, or a mobile charger brought over ([`crate::recovery`]);
+//!    tow, a mobile charger brought over, or (with Earth's approval, or the
+//!    level-3 fallback) parts from a donor ([`crate::recovery`]);
 //! 4. maintenance so pressing it cannot wait for a natural break
 //!    ([`crate::health`]);
-//! 5. send robots below their energy low-water mark to charge;
-//! 6. run the auction over free robots (and robots on interruptible jobs);
-//! 7. give leftover robots maintenance at this natural break, a charge when
+//! 5. station a relay, or stand one down, where coverage needs it;
+//! 6. send robots below their energy low-water mark to charge;
+//! 7. run the auction over free robots (and robots on interruptible jobs);
+//! 8. give leftover robots maintenance at this natural break, a charge when
 //!    work waits on energy, an opportunistic or parking top-up (held back
 //!    when it would drain the site bank at night or in a storm), or a move
 //!    towards upcoming work;
-//! 8. ask for a wake-up while anything waits on time.
+//! 9. report to Earth: a notify for every level-2 action, approval requests,
+//!    and a periodic status report ([`crate::authority`]);
+//! 10. ask for a wake-up while anything waits on time.
 //!
-//! Extension points: week 6 adds an authority gate where commands are issued
-//! (recovery options already name their policy action and pass through
-//! [`crate::recovery::permitted`]), Earth messages in [`State::on_uplink`],
-//! and coverage-aware planning.
+//! Every action passes the authority layer: level 1 is taken, level 2 is
+//! taken and notified, level 3 and 4 only with an approval in hand. Robots
+//! out of coverage are never commanded; their snapshots are stale and their
+//! events arrive late.
 
 use crate::allocator::{self, AuctionResult, Bidder, Context};
+use crate::authority::{self, Authority, Reach, Stakes};
 use crate::capacity::{CapacityPlan, Workload};
 use crate::config::Config;
+use crate::coverage::Coverage;
 use crate::diag::Diag;
 use crate::energy::{ChargePlan, ChargeSource, Energy, StationLoad};
 use crate::executor::{Assignment, Executor, Job, Outcome, PlannedUse, Sent, TowPurpose};
@@ -36,11 +42,12 @@ use crate::planner::{Planner, SpoilKind};
 use crate::power::PowerModel;
 use crate::recovery::{self, Step};
 use crate::registry::Registry;
-use crate::tasks::{Stage, Task};
+use crate::tasks::{Stage, Task, TaskKey};
 use crate::world::WorldModel;
 use arcadia_protocol::{
     Action, CapabilityName, Command, Decision, EarthToSite, End, Event, EventKind, FailReason,
-    GridCoord, Hello, Objective, Observation, RejectReason, RobotStatus, Uplink,
+    Fallback, GoalProgress, GridCoord, Hello, Objective, Observation, RejectReason, RobotStatus,
+    Uplink,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -61,6 +68,19 @@ const REJECTION_STREAK_LIMIT: u32 = 3;
 
 /// Back-off after a recovery or maintenance command fails or is refused, s.
 const RECOVERY_BACKOFF_S: f64 = 120.0;
+
+/// Robot commands that are routine work: if a policy puts one at level 3 or
+/// 4, ArcadiaOS asks Earth for a standing approval before using it again.
+const ROUTINE_ACTIONS: [&str; 14] = [
+    "move_to", "scan", "dig", "grade", "haul", "compact", "sinter", "charge", "relay", "wait",
+    "cancel", "repair", "service", "tow",
+];
+
+/// Approval purpose for a standing approval of a routine action.
+const ROUTINE: &str = "routine";
+
+/// Approval purpose for charging from the site's energy reserve.
+const RESERVE: &str = "charging from the site energy reserve";
 
 /// Decision-making core. The session loop in [`crate::run`] feeds it observations.
 #[derive(Debug, Clone, Default)]
@@ -96,6 +116,21 @@ struct State {
     fault_marks: Vec<usize>,
     same_time: (f64, u32),
     decisions: u64,
+    /// Policy levels, approvals and messages to Earth.
+    authority: Authority,
+    /// The covered part of the site at this decision.
+    coverage: Coverage,
+    /// Robots known to be lost, to notice new losses.
+    lost_marks: Vec<bool>,
+    /// Tasks released by a disabled robot whose reassignment awaits Earth:
+    /// task → (the robot that had it, approval purpose).
+    held: BTreeMap<TaskKey, (usize, String)>,
+    /// A request was sent that the next decision may act on at once.
+    act_soon: bool,
+    /// Earth was told the site is charging from its energy reserve.
+    reserve_noted: bool,
+    /// Strips ArcadiaOS asked Earth about: (donor, robot to restore).
+    strips: Vec<(usize, usize)>,
 }
 
 /// Working state of one decision.
@@ -113,6 +148,15 @@ struct Round {
     workload: Workload,
     /// Station power drawn by charging ArcadiaOS has scheduled, W.
     charging_w: f64,
+    /// Routine actions at level 3 or 4 without a standing approval.
+    blocked: BTreeSet<&'static str>,
+    /// New station charging would draw on the site's energy reserve, which
+    /// the policy does not allow without approval: the supply to spare, W.
+    reserve_spare_w: Option<f64>,
+    /// Charging was held back because of the reserve.
+    reserve_wanted: bool,
+    /// Station charges issued in this decision.
+    station_charges: usize,
 }
 
 impl Round {
@@ -185,12 +229,14 @@ impl Coordinator {
                 hello.scenario.power.mode
             )
         });
+        let coverage = Coverage::new(&world.base_station, world.site.cell_size_m, &[]);
         self.state = Some(State {
             energy: Energy::new(&reg),
             health: Health::new(reg.len()),
             power: PowerModel::new(hello.scenario.power.clone(), hello.scenario.sol_length_s),
             service_s: self.cfg.service_s,
             fault_marks: vec![0; reg.len()],
+            lost_marks: vec![false; reg.len()],
             world,
             reg,
             planner: None,
@@ -199,6 +245,12 @@ impl Coordinator {
             exec: Executor::new(),
             same_time: (f64::NAN, 0),
             decisions: 0,
+            authority: Authority::default(),
+            coverage,
+            held: BTreeMap::new(),
+            act_soon: false,
+            reserve_noted: false,
+            strips: Vec::new(),
         });
     }
 
@@ -214,6 +266,7 @@ impl Coordinator {
                 decision.commands = commands;
                 decision.wake_at = wake_at;
             }
+            decision.to_earth = st.authority.take_outbox();
         }
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         self.timing.total_ms += ms;
@@ -289,6 +342,11 @@ impl Coordinator {
     pub fn health(&self) -> Option<&Health> {
         self.state.as_ref().map(|s| &s.health)
     }
+
+    /// The authority layer: requests, answers and traffic to Earth.
+    pub fn authority(&self) -> Option<&Authority> {
+        self.state.as_ref().map(|s| &s.authority)
+    }
 }
 
 /// What a command sent now to robot `r` is expected to cost and expose.
@@ -342,6 +400,15 @@ impl State {
             self.same_time = (t, 1);
         }
         self.world.fleet.update(&obs.robots);
+        for r in 0..self.reg.len() {
+            let lost = self.world.fleet.get(r).lost();
+            if lost && !self.lost_marks[r] {
+                diag.info(t, || format!("{} is lost", self.reg.robot(r).id));
+                self.authority.major_event();
+                self.capacity_dirty = true;
+            }
+            self.lost_marks[r] = lost;
+        }
         for e in &obs.events {
             self.on_event(e, cfg, diag);
         }
@@ -443,9 +510,39 @@ impl State {
                 self.capacity_dirty = true;
             }
             Uplink::PolicyUpdate { policy } => {
+                diag.info(self.world.now, || {
+                    format!(
+                        "policy version {} in effect: {}",
+                        policy.policy_version,
+                        policy
+                            .levels
+                            .iter()
+                            .filter(|(a, l)| self.world.policy.level_for(a) != **l)
+                            .map(|(a, l)| format!("{a} {}", l.get()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                });
                 self.world.policy = policy.clone();
+                self.authority.counts.policy_updates += 1;
+                self.authority.major_event();
             }
-            _ => {}
+            Uplink::Approve { request_id, .. } => {
+                diag.info(self.world.now, || format!("Earth approves {request_id}"));
+                self.authority.on_answer(request_id, true, self.world.now);
+            }
+            Uplink::Veto { request_id, .. } => {
+                diag.info(self.world.now, || format!("Earth vetoes {request_id}"));
+                self.authority.on_answer(request_id, false, self.world.now);
+            }
+            Uplink::Reprioritize { priorities } => {
+                // One goal: priorities are recorded, and nothing else changes.
+                for p in priorities {
+                    self.authority
+                        .priorities
+                        .insert(p.goal_id.clone(), p.priority);
+                }
+            }
         }
     }
 
@@ -544,7 +641,9 @@ impl State {
         match a.job.clone() {
             Job::Work { task, plan } => match outcome {
                 Outcome::Completed { .. } => self.apply_work(&a, &task, &plan, t, cfg, diag),
-                Outcome::Failed { reason, .. } => self.work_failed(r, &task, &plan, reason, t, cfg),
+                Outcome::Failed { reason, .. } => {
+                    self.work_failed(r, &task, &plan, reason, t, cfg, diag)
+                }
                 Outcome::Rejected { reason, .. } => self.work_rejected(r, &task, reason, t, cfg),
             },
             Job::Charge { plan, .. } => {
@@ -597,6 +696,12 @@ impl State {
                     self.health.serviced(beneficiary);
                     self.capacity_dirty = true;
                 } else if !cancelled {
+                    self.exec.back_off_robot(r, t + RECOVERY_BACKOFF_S);
+                }
+            }
+            // A relay ends only by failing; a cancellation is the planner's own.
+            Job::Relay { .. } => {
+                if !cancelled {
                     self.exec.back_off_robot(r, t + RECOVERY_BACKOFF_S);
                 }
             }
@@ -679,6 +784,7 @@ impl State {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn work_failed(
         &mut self,
         r: usize,
@@ -687,9 +793,13 @@ impl State {
         reason: FailReason,
         t: f64,
         cfg: &Config,
+        diag: &Diag,
     ) {
         if reason == FailReason::Cancelled {
             return;
+        }
+        if matches!(reason, FailReason::Fault | FailReason::Stuck) {
+            self.released(r, task, reason, cfg, diag);
         }
         let haul = matches!(task.stage, Stage::Fill | Stage::Berm);
         if reason == FailReason::Blocked {
@@ -754,6 +864,7 @@ impl State {
     fn dispatch(&mut self, cfg: &Config, diag: &Diag) -> (Vec<Command>, Option<f64>) {
         let now = self.world.now;
         let next_cooldown = self.exec.prune_cooldowns(now);
+        self.coverage = self.coverage_now();
         if self.same_time.1 > cfg.max_same_time_decisions {
             diag.info(now, || "many decisions at one sim time; pausing".into());
             return (Vec::new(), Some(now + 60.0));
@@ -778,7 +889,9 @@ impl State {
         let n = self.reg.len();
         let available: Vec<bool> = (0..n).map(|r| self.world.fleet.get(r).operable()).collect();
         let workload = planner.workload(&self.world, &self.reg, cfg);
-        if self.capacity_dirty || self.capacity.stale(&workload, &available) {
+        if (self.capacity_dirty || self.capacity.stale(&workload, &available))
+            && self.replan_allowed(&available, cfg, diag)
+        {
             self.capacity = CapacityPlan::solve(&workload, &self.reg, &available, cfg);
             self.capacity_dirty = false;
             diag.info(now, || describe_capacity(&self.capacity, &self.reg));
@@ -786,12 +899,22 @@ impl State {
         self.release_chargers(cfg);
 
         let mut round = self.round(workload, now);
+        round.blocked = self.blocked_actions();
+        round.reserve_spare_w = self.reserve_lock(cfg);
+        let tasks = self
+            .planner
+            .as_ref()
+            .map(|p| p.tasks(&self.world, &self.exec.busy(), cfg))
+            .unwrap_or_default();
+        self.held.retain(|k, _| tasks.iter().any(|t| t.key == *k));
         self.recover(&mut round, cfg, diag);
         self.maintain(&mut round, None, cfg, diag);
+        self.relay(&mut round, &tasks, cfg, diag);
         let stranded = self.charge_low(&mut round, cfg, diag);
-        let result = self.auction(&mut round, &stranded, cfg, diag);
+        let result = self.auction(&mut round, &tasks, &stranded, cfg, diag);
         self.maintain(&mut round, Some(&result), cfg, diag);
         self.leftovers(&mut round, &result, &stranded, cfg, diag);
+        self.report(&mut round, cfg, diag);
 
         let mut wake = next_cooldown.filter(|&w| w > now);
         let waiting =
@@ -800,7 +923,327 @@ impl State {
             let idle_wake = now + cfg.idle_wake_s;
             wake = Some(wake.map_or(idle_wake, |w| w.min(idle_wake)));
         }
+        // Look again when Earth's answer is due, or at once after asking
+        // with no time to wait (the fallback then applies).
+        let mut earth = self.authority.next_deadline(now);
+        if std::mem::take(&mut self.act_soon) {
+            earth = Some(earth.map_or(now + 1.0, |t| t.min(now + 1.0)));
+        }
+        if let Some(t) = earth.filter(|&t| t > now) {
+            wake = Some(wake.map_or(t, |w| w.min(t)));
+        }
         (round.cmds, wake)
+    }
+
+    /// The covered part of the site now: the base station, and the relays
+    /// ArcadiaOS has holding at their positions.
+    fn coverage_now(&self) -> Coverage {
+        let holding: Vec<(GridCoord, f64)> = self
+            .exec
+            .all_active()
+            .filter_map(|a| {
+                let Job::Relay { at } = a.job else {
+                    return None;
+                };
+                let s = self.world.fleet.get(a.robot).state.as_ref()?;
+                let holding = s.position == at
+                    && s.status == RobotStatus::Working
+                    && s.current_command.as_deref() == Some(a.command_id.as_str());
+                let range = self.relay_range(a.robot);
+                (holding && range > 0.0).then_some((at, range))
+            })
+            .collect();
+        Coverage::new(
+            &self.world.base_station,
+            self.world.site.cell_size_m,
+            &holding,
+        )
+    }
+
+    /// Robot `r`'s relay range, m (0 without a relay capability that has one).
+    fn relay_range(&self, r: usize) -> f64 {
+        self.world
+            .fleet
+            .get(r)
+            .spec
+            .capability(CapabilityName::Relay)
+            .and_then(|c| c.range_m)
+            .filter(|&m| m.is_finite())
+            .unwrap_or(0.0)
+    }
+
+    /// Routine actions the policy puts at level 3 or 4 without a standing approval.
+    fn blocked_actions(&self) -> BTreeSet<&'static str> {
+        let policy = &self.world.policy;
+        let purpose = routine_purpose(policy);
+        ROUTINE_ACTIONS
+            .iter()
+            .copied()
+            .filter(|a| {
+                authority::level(policy, a) >= 3
+                    && self
+                        .authority
+                        .authorization(a, &purpose, self.world.now)
+                        .is_none()
+            })
+            .collect()
+    }
+
+    /// The supply to spare for new station charging while the site's energy
+    /// reserve is locked; `None` when it is not. The reserve is the bottom
+    /// `bank_floor_frac` of the site bank. Charging that draws on it commits
+    /// the reserve (`commit_energy_reserve`), which at level 3 or 4 waits for
+    /// Earth's approval.
+    fn reserve_lock(&self, cfg: &Config) -> Option<f64> {
+        let p = self.world.power.as_ref()?;
+        let low = p.storage_capacity_wh > 0.0
+            && p.storage_wh <= cfg.bank_floor_frac * p.storage_capacity_wh;
+        if !low
+            || authority::level(&self.world.policy, "commit_energy_reserve") <= 2
+            || self
+                .authority
+                .authorization("commit_energy_reserve", RESERVE, self.world.now)
+                .is_some()
+        {
+            return None;
+        }
+        Some((p.solar_w + p.fission_w - p.demand_w).max(0.0))
+    }
+
+    /// Whether the capacity plan may be re-solved now. Re-solving for a
+    /// changed set of working robots is a `replan`: notified at level 2,
+    /// and at levels 3 and 4 held (the old plan stands) until Earth agrees.
+    fn replan_allowed(&mut self, available: &[bool], cfg: &Config, diag: &Diag) -> bool {
+        if !self.capacity.fleet_changed(available) {
+            return true;
+        }
+        let changes: Vec<String> = (0..self.reg.len())
+            .filter(|&r| self.capacity.solved_available.get(r) != available.get(r))
+            .map(|r| {
+                let id = &self.reg.robot(r).id;
+                if available.get(r).copied().unwrap_or(false) {
+                    format!("{id} back")
+                } else {
+                    format!("without {id}")
+                }
+            })
+            .collect();
+        let what = format!("roles re-planned {}", changes.join(", "));
+        match authority::level(&self.world.policy, "replan") {
+            1 => true,
+            2 => {
+                self.authority.note("replan", what, vec![]);
+                true
+            }
+            _ => {
+                let purpose = format!("replan {}", changes.join(", "));
+                let now = self.world.now;
+                if self
+                    .authority
+                    .authorization("replan", &purpose, now)
+                    .is_some()
+                {
+                    return true;
+                }
+                if !self.authority.asked("replan", &purpose) {
+                    let stakes = Stakes {
+                        benefit_s: cfg.routine_benefit_s,
+                        wait_cost_per_s: 1.0,
+                        risk_s: 0.0,
+                    };
+                    self.ask_earth("replan", &purpose, what, stakes, cfg, diag);
+                }
+                false
+            }
+        }
+    }
+
+    /// Ask Earth about `action` for `purpose`. At level 3 the level-3 rule
+    /// sets the deadline and the fallback (and may say asking is pointless);
+    /// at level 4 only an approval counts, so the request always goes out,
+    /// to be answered when Earth can. Returns whether a request went out.
+    fn ask_earth(
+        &mut self,
+        action: &str,
+        purpose: &str,
+        summary: String,
+        stakes: Stakes,
+        cfg: &Config,
+        diag: &Diag,
+    ) -> bool {
+        let now = self.world.now;
+        let policy = self.world.policy.clone();
+        let max_wait = policy.level3.max_wait_s.max(0.0);
+        let reach = self.reach(cfg);
+        let ask = if authority::level(&policy, action) >= 4 {
+            let wait = reach.answer_in_s(now) * cfg.answer_margin.max(1.0);
+            authority::Ask {
+                decide_by_t: now + wait.min(max_wait),
+                fallback: Fallback::Abort,
+            }
+        } else {
+            match authority::level3_rule(&stakes, reach, now, max_wait, cfg.answer_margin) {
+                Some(a) => a,
+                None => return false,
+            }
+        };
+        diag.info(now, || {
+            format!(
+                "asking Earth to {action} ({summary}): decide by {:.0}, fallback {:?}",
+                ask.decide_by_t, ask.fallback
+            )
+        });
+        self.authority
+            .ask(&policy, action, purpose, summary, ask, now);
+        if ask.decide_by_t <= now {
+            self.act_soon = true;
+        }
+        true
+    }
+
+    /// Robot `r` was disabled during `task`, which other robots may now take
+    /// over: `reassign_task`. Notified at level 2; at levels 3 and 4 the task
+    /// is held for `r` until Earth agrees.
+    fn released(&mut self, r: usize, task: &Task, reason: FailReason, cfg: &Config, diag: &Diag) {
+        let what = format!(
+            "{} ({},{}) released by {} after {reason:?}",
+            task.stage.name(),
+            task.cell().x,
+            task.cell().y,
+            self.reg.robot(r).id
+        );
+        match authority::level(&self.world.policy, "reassign_task") {
+            1 => {}
+            2 => self.authority.note("reassign_task", what, vec![]),
+            _ => {
+                let purpose = format!("reassign {:?}", task.key);
+                self.held.insert(task.key, (r, purpose.clone()));
+                if !self.authority.asked("reassign_task", &purpose) {
+                    let stakes = Stakes {
+                        benefit_s: cfg.routine_benefit_s,
+                        wait_cost_per_s: 1.0,
+                        risk_s: 0.0,
+                    };
+                    self.ask_earth("reassign_task", &purpose, what, stakes, cfg, diag);
+                }
+            }
+        }
+    }
+
+    /// Step 9: what Earth hears from this decision. Level-2 commands are
+    /// notified, one notify per action; level 3 and 4 commands carry their
+    /// approval; standing approvals are asked for; and a status report goes
+    /// out when one is due.
+    fn report(&mut self, round: &mut Round, cfg: &Config, diag: &Diag) {
+        let now = round.now;
+        let policy = self.world.policy.clone();
+        let purpose = routine_purpose(&policy);
+        let mut notified: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+        for c in &mut round.cmds {
+            let action = c.action.name();
+            match authority::level(&policy, action) {
+                1 => {}
+                2 => notified
+                    .entry(action)
+                    .or_default()
+                    .push(c.command_id.clone()),
+                _ => {
+                    if c.approval_id.is_none() {
+                        c.approval_id = self.authority.authorization(action, &purpose, now);
+                    }
+                }
+            }
+        }
+        for (action, ids) in notified {
+            self.authority.notify_commands(action, ids);
+        }
+        for action in round.blocked.clone() {
+            if !self.authority.asked(action, &purpose) {
+                let level = authority::level(&policy, action);
+                let stakes = Stakes {
+                    benefit_s: cfg.routine_benefit_s,
+                    wait_cost_per_s: 1.0,
+                    risk_s: 0.0,
+                };
+                let summary = format!("standing approval to {action}, now level {level}");
+                self.ask_earth(action, &purpose, summary, stakes, cfg, diag);
+            }
+        }
+        // The energy reserve: ask before charging from it, or tell Earth.
+        let bank_low = self.world.power.as_ref().is_some_and(|p| {
+            p.storage_capacity_wh > 0.0
+                && p.storage_wh <= cfg.bank_floor_frac * p.storage_capacity_wh
+        });
+        if round.reserve_wanted
+            && !self
+                .authority
+                .pending("commit_energy_reserve", RESERVE, now)
+        {
+            let stakes = Stakes {
+                benefit_s: cfg.routine_benefit_s,
+                wait_cost_per_s: 1.0,
+                risk_s: cfg.cannibalize_risk_s,
+            };
+            let summary = "charge robots from the last quarter of the site bank".to_string();
+            if !self.authority.asked("commit_energy_reserve", RESERVE) {
+                self.ask_earth("commit_energy_reserve", RESERVE, summary, stakes, cfg, diag);
+            }
+        }
+        if bank_low
+            && round.station_charges > 0
+            && !self.reserve_noted
+            && authority::level(&policy, "commit_energy_reserve") == 2
+        {
+            self.authority.note(
+                "commit_energy_reserve",
+                "charging from the last quarter of the site bank".into(),
+                vec![],
+            );
+            self.reserve_noted = true;
+        }
+        if !bank_low {
+            self.reserve_noted = false;
+        }
+        if self
+            .authority
+            .status_due(now, self.world.link_up(), cfg.status_period_s)
+        {
+            let (summary, progress) = self.status(cfg);
+            diag.info(now, || format!("status report: {summary}"));
+            self.authority.report_status(now, summary, progress);
+        }
+    }
+
+    /// A status report: progress against the goal and the state of the crew.
+    fn status(&self, cfg: &Config) -> (String, Vec<GoalProgress>) {
+        let p = self
+            .planner
+            .as_ref()
+            .map(|pl| pl.progress(&self.world, cfg))
+            .unwrap_or_default();
+        let n = self.reg.len();
+        let count = |f: &dyn Fn(usize) -> bool| (0..n).filter(|&r| f(r)).count();
+        let working = count(&|r| self.world.fleet.get(r).operable());
+        let disabled = count(&|r| self.world.fleet.get(r).recoverable());
+        let lost = count(&|r| self.world.fleet.get(r).lost());
+        let sol = (self.world.now - self.world.start_t) / self.world.sol_length_s.max(1.0);
+        let summary = format!(
+            "sol {sol:.2}: pad {}/{} cells finished, {} verified; berm {}/{} confirmed; {working} robots working, {disabled} disabled, {lost} lost",
+            p.finished, p.pad_cells, p.verified, p.berm_confirmed, p.berm_cells
+        );
+        let total = (p.pad_cells + p.berm_cells).max(1) as f64;
+        let fraction = ((p.finished + p.berm_confirmed) as f64 / total).clamp(0.0, 1.0);
+        let progress = self
+            .planner
+            .as_ref()
+            .map(|pl| {
+                vec![GoalProgress {
+                    goal_id: pl.goal_id.clone(),
+                    fraction_complete: fraction,
+                }]
+            })
+            .unwrap_or_default();
+        (summary, progress)
     }
 
     /// Release mobile chargers whose client no longer needs them.
@@ -861,6 +1304,7 @@ impl State {
         for r in 0..self.reg.len() {
             let e = self.world.fleet.get(r);
             if !e.operable()
+                || !self.in_contact(r)
                 || self.exec.robot_cooling(r, now)
                 || self.energy.reserved.contains_key(&r)
                 || engaged.contains(&r)
@@ -882,6 +1326,17 @@ impl State {
         round
     }
 
+    /// Whether the site can hear robot `r`: its snapshot is live, not the
+    /// stale last-contact state of a robot out of coverage.
+    fn in_contact(&self, r: usize) -> bool {
+        self.world
+            .fleet
+            .get(r)
+            .state
+            .as_ref()
+            .is_some_and(|s| s.in_relay_coverage)
+    }
+
     /// Whether robot `r` could do any remaining work, were it working.
     fn has_work(&self, r: usize, workload: &Workload) -> bool {
         crate::registry::WORK_CAPABILITIES
@@ -891,6 +1346,9 @@ impl State {
 
     /// Cancel robot `r`'s interruptible job so it can take another.
     fn free_up(&mut self, round: &mut Round, r: usize, diag: &Diag) {
+        if round.blocked.contains("cancel") {
+            return;
+        }
         if self.exec.active(r).is_some_and(Assignment::interruptible)
             && let Some((cancel, old)) = self.exec.cancel(r, &self.reg.robot(r).id)
         {
@@ -917,25 +1375,34 @@ impl State {
         }
     }
 
-    /// Step 3: bring disabled robots back, most needed first.
+    /// Step 3: bring disabled robots back, most needed first. Robots out of
+    /// contact are left alone: their snapshots are stale.
     fn recover(&mut self, round: &mut Round, cfg: &Config, diag: &Diag) {
         let now = round.now;
         let n = self.reg.len();
         let mut targets: Vec<(bool, usize)> = (0..n)
             .filter(|&r| self.world.fleet.get(r).recoverable())
+            .filter(|&r| self.in_contact(r))
             .filter(|&r| !self.exec.robot_cooling(r, now))
             .map(|r| (self.has_work(r, &round.workload), r))
             .collect();
         // Robots whose capabilities still have work come first.
         targets.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let strip_level = authority::level(&self.world.policy, "cannibalize");
         for (_, x) in targets {
+            // A robot about to be stripped for parts is not worth recovering.
+            if self.strip_live(|d, _| d == x) {
+                continue;
+            }
             let engaged = self.exec.engaged();
             let running: BTreeSet<usize> = self.exec.all_active().map(|a| a.robot).collect();
             let awaited = self.energy.reserved.values().any(|&k| k == x);
+            // A helper on an interruptible job is freed with a cancel, if the policy allows one.
+            let can_cancel = !round.blocked.contains("cancel");
             let mut helpers: Vec<usize> = round
                 .free
                 .iter()
-                .chain(round.interruptible.iter())
+                .chain(round.interruptible.iter().filter(|_| can_cancel))
                 .copied()
                 .filter(|&h| h != x)
                 .collect();
@@ -943,7 +1410,16 @@ impl State {
             helpers.dedup();
             let capacity = cfg.depot_capacity;
             let depot_wait = |d: usize, t: f64| round.depot_wait(d, capacity, t);
-            let plan = {
+            let blocked = &round.blocked;
+            let may = |action: &str| !blocked.contains(action);
+            let (authority, reg) = (&self.authority, &self.reg);
+            let may_strip = |d: usize| {
+                strip_level <= 2
+                    || authority
+                        .authorization("cannibalize", &strip_purpose(reg, d, x), now)
+                        .is_some()
+            };
+            let (plan, ask) = {
                 let ctx = recovery::Ctx {
                     world: &self.world,
                     reg: &self.reg,
@@ -955,9 +1431,23 @@ impl State {
                     service_s: self.service_s,
                     engaged: &engaged,
                     running: &running,
+                    may: &may,
+                    may_strip: &may_strip,
                 };
-                recovery::plan(&ctx, x, &helpers)
+                let plan = recovery::plan(&ctx, x, &helpers);
+                let ask = (strip_level >= 3)
+                    .then(|| recovery::best_cannibalize(&ctx, x, &helpers))
+                    .flatten()
+                    .filter(|c| plan.as_ref().is_none_or(|p| c.cost_s < p.cost_s));
+                (plan, ask)
             };
+            // Parts from a donor would beat everything allowed: ask Earth, or
+            // wait for its answer, unless the level-3 rule says not to bother.
+            if let Some(c) = ask
+                && self.weigh_cannibalize(x, plan.as_ref(), &c, cfg, diag)
+            {
+                continue;
+            }
             let Some(plan) = plan else { continue };
             // A mobile charger is on its way: wait for it.
             if awaited && plan.step.helper().is_some() {
@@ -975,8 +1465,111 @@ impl State {
         }
     }
 
+    /// Cannibalizing `c` would bring robot `x` back sooner than `alt`, the
+    /// best option allowed now, but the policy needs Earth for it. Returns
+    /// whether to hold `x` for Earth: just asked, or a request is pending.
+    /// The level-3 rule weighs the time saved against waiting and against
+    /// the risk of stripping a robot Earth would rather keep.
+    fn weigh_cannibalize(
+        &mut self,
+        x: usize,
+        alt: Option<&recovery::Plan>,
+        c: &recovery::Plan,
+        cfg: &Config,
+        diag: &Diag,
+    ) -> bool {
+        let now = self.world.now;
+        let recovery::Step::Cannibalize { donor, .. } = c.step else {
+            return false;
+        };
+        let purpose = strip_purpose(&self.reg, donor, x);
+        if self.authority.pending("cannibalize", &purpose, now) {
+            return true;
+        }
+        // Never strip a robot that is itself waiting for parts.
+        if self.strip_live(|_, t| t == donor) {
+            return false;
+        }
+        // Answered, or lapsed: what is allowed now stands.
+        if self.authority.asked("cannibalize", &purpose) {
+            return false;
+        }
+        let weight = self.capacity.utilization(x).clamp(0.2, 1.0);
+        let alt_s = alt.map_or(cfg.no_alternative_s, |p| p.cost_s);
+        let stakes = Stakes {
+            benefit_s: (alt_s - c.cost_s).max(0.0) * weight,
+            wait_cost_per_s: weight,
+            risk_s: cfg.cannibalize_risk_s,
+        };
+        let max_wait = self.world.policy.level3.max_wait_s;
+        let reach = self.reach(cfg);
+        let ask = match authority::level3_rule(&stakes, reach, now, max_wait, cfg.answer_margin) {
+            Some(a) if authority::level(&self.world.policy, "cannibalize") == 3 => a,
+            // Level 4: only worth asking if an answer can come, and never on a fallback.
+            Some(a) if a.decide_by_t > now => authority::Ask {
+                fallback: Fallback::Abort,
+                ..a
+            },
+            _ => return false,
+        };
+        let summary = format!(
+            "cannibalize {} to restore {}: back in about {:.1} h instead of {:.1} h",
+            self.reg.robot(donor).id,
+            self.reg.robot(x).id,
+            c.cost_s / 3600.0,
+            alt_s / 3600.0
+        );
+        diag.info(now, || {
+            format!(
+                "asking Earth: {summary} (decide by {:.0}, fallback {:?})",
+                ask.decide_by_t, ask.fallback
+            )
+        });
+        let policy = self.world.policy.clone();
+        self.authority
+            .ask(&policy, "cannibalize", &purpose, summary, ask, now);
+        self.strips.push((donor, x));
+        if ask.decide_by_t <= now {
+            self.act_soon = true;
+        }
+        true
+    }
+
+    /// Whether a strip ArcadiaOS asked about, matching `f(donor, target)`, is
+    /// still pending or authorized.
+    fn strip_live(&self, f: impl Fn(usize, usize) -> bool) -> bool {
+        let now = self.world.now;
+        self.strips.iter().any(|&(d, t)| {
+            let purpose = strip_purpose(&self.reg, d, t);
+            f(d, t)
+                && (self.authority.pending("cannibalize", &purpose, now)
+                    || self
+                        .authority
+                        .authorization("cannibalize", &purpose, now)
+                        .is_some())
+        })
+    }
+
+    /// How fast Earth can answer now: a round trip at the reported delay plus
+    /// mission control's typical response time.
+    fn reach(&self, cfg: &Config) -> Reach {
+        let d = self.world.one_way_delay_s(cfg.assumed_delay_s);
+        let answer_s = 2.0 * d + cfg.earth_response_s;
+        if self.world.link_up() {
+            Reach::Up { answer_s }
+        } else {
+            Reach::Down {
+                back_t: self.world.comms.as_ref().and_then(|c| c.expected_restore_t),
+                answer_s,
+            }
+        }
+    }
+
     /// Send helper `h` to charge up to `need_wh` (and a little more).
     fn charge_for(&mut self, round: &mut Round, h: usize, need_wh: f64, cfg: &Config, diag: &Diag) {
+        if round.blocked.contains("charge") {
+            return;
+        }
         let cap = self.reg.robot(h).battery_wh;
         let until = (need_wh + cfg.min_charge_frac * cap).min(cap);
         let chargers = chargers_for(h, &round.free, &self.energy, &self.exec, &self.reg);
@@ -1058,6 +1651,8 @@ impl State {
                         service_s: self.service_s,
                         engaged: &engaged,
                         running: &running,
+                        may: &|_| true,
+                        may_strip: &|_| false,
                     };
                     recovery::recovery_charge_wh(&ctx, x, source)
                 };
@@ -1181,9 +1776,14 @@ impl State {
                 };
                 let s = sent(&self.world, executor, plan.cost_s, PlannedUse::default());
                 let id = self.reg.robot(executor).id.clone();
-                round
-                    .cmds
-                    .push(self.exec.issue(executor, &id, job, action, s));
+                let mut cmd = self.exec.issue(executor, &id, job, action, s);
+                // The approval Earth gave (or the fallback that fired) for this very strip.
+                cmd.approval_id = self.authority.authorization(
+                    "cannibalize",
+                    &strip_purpose(&self.reg, donor, x),
+                    now,
+                );
+                round.cmds.push(cmd);
                 round.take(executor);
             }
         }
@@ -1300,7 +1900,8 @@ impl State {
             });
             match case.kind {
                 Maintenance::Repair => {
-                    let Some((_, h, work_s)) = repair else {
+                    let Some((_, h, work_s)) = repair.filter(|_| !round.blocked.contains("repair"))
+                    else {
                         continue;
                     };
                     let hpos = self.world.fleet.get(h).position().unwrap_or(pos);
@@ -1321,7 +1922,10 @@ impl State {
                     round.take(r);
                 }
                 Maintenance::Service => {
-                    let Some((_, d, est)) = service else { continue };
+                    let Some((_, d, est)) = service.filter(|_| !round.blocked.contains("service"))
+                    else {
+                        continue;
+                    };
                     let depot = &self.world.depots[d];
                     let planned = drive_use(&self.reg, r, pos, depot.position);
                     round.depots.entry(d).or_default().push(round.now + est);
@@ -1340,10 +1944,195 @@ impl State {
         }
     }
 
-    /// Step 5: robots at their low-water mark charge before anything else.
+    /// Step 5: station a relay where coverage is wanted (work that would end
+    /// out of base-station coverage, or a robot out of contact well past its
+    /// expected return) when the robot time it saves beats what the relay
+    /// robot gives up; stand it down when nothing needs it any more, or when
+    /// its own battery runs low.
+    fn relay(&mut self, round: &mut Round, tasks: &[Task], cfg: &Config, diag: &Diag) {
+        let now = round.now;
+        let cs = self.world.site.cell_size_m;
+        let base = Coverage::new(&self.world.base_station, cs, &[]);
+        let (w, h) = (self.world.site.width, self.world.site.height);
+        let from = self.world.base_station.position;
+        // Demand: cells wanting coverage, with the robot time coverage saves there.
+        let mut demand: Vec<(GridCoord, f64)> = Vec::new();
+        for t in tasks {
+            if round.blocked.contains(stage_action(t.stage)) {
+                continue;
+            }
+            let uncovered = match t.stage {
+                Stage::Survey | Stage::Verify | Stage::BermCheck | Stage::Recheck => {
+                    crate::coverage::safe_scan_area(&t.area, from, &base, w, h, 6).is_none()
+                }
+                _ => !base.covers(t.cell()),
+            };
+            let doable = self
+                .reg
+                .capable(t.capability())
+                .iter()
+                .any(|&r| self.world.fleet.get(r).operable() && self.in_contact(r));
+            if uncovered && doable {
+                demand.push((
+                    geom::clamp_into(from, &t.area),
+                    cfg.lost_link_timeout_s * 0.5,
+                ));
+            }
+        }
+        for r in 0..self.reg.len() {
+            let e = self.world.fleet.get(r);
+            let Some(state) = e.state.as_ref() else {
+                continue;
+            };
+            if e.lost() || state.in_relay_coverage {
+                continue;
+            }
+            let busy_until = self
+                .exec
+                .active(r)
+                .map_or(state.telemetry_t, |a| a.est_end_t.max(state.telemetry_t));
+            if now > busy_until + cfg.lost_link_timeout_s + cfg.stranded_margin_s {
+                demand.push((state.position, cfg.no_alternative_s / 4.0));
+            }
+        }
+        let active = self.exec.all_active().find_map(|a| match a.job {
+            Job::Relay { at } => Some((a.robot, at)),
+            _ => None,
+        });
+        if let Some((rr, at)) = active {
+            let range = self.relay_range(rr);
+            let serving = demand
+                .iter()
+                .any(|&(c, _)| crate::coverage::within(c, at, range, cs))
+                || self.relay_dependents(rr, &base);
+            let low = Energy::low(&self.world, &self.reg, rr, cfg);
+            if (!serving || low)
+                && !round.blocked.contains("cancel")
+                && self.in_contact(rr)
+                && let Some((cancel, _)) = self.exec.cancel(rr, &self.reg.robot(rr).id)
+            {
+                diag.info(now, || {
+                    format!(
+                        "{}: relay at ({},{}) stood down{}",
+                        self.reg.robot(rr).id,
+                        at.x,
+                        at.y,
+                        if low { " to charge" } else { "" }
+                    )
+                });
+                round.cmds.push(cancel);
+                round.take(rr);
+            }
+            return;
+        }
+        if demand.is_empty() || round.blocked.contains("relay") {
+            return;
+        }
+        // The best relay robot and position: as much demand served as
+        // possible from a covered cell, then the shortest drive.
+        let covered: Vec<GridCoord> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| GridCoord { x, y }))
+            .filter(|&c| base.covers(c))
+            .collect();
+        let mut pick: Option<(f64, f64, usize, GridCoord)> = None;
+        for &r in &round.free {
+            let range = self.relay_range(r);
+            let Some(pos) = self.world.fleet.get(r).position() else {
+                continue;
+            };
+            if range <= 0.0 || Energy::low(&self.world, &self.reg, r, cfg) {
+                continue;
+            }
+            for &c in &covered {
+                let served: f64 = demand
+                    .iter()
+                    .filter(|&&(d, _)| crate::coverage::within(d, c, range, cs))
+                    .map(|&(_, b)| b)
+                    .sum();
+                let travel = self.reg.travel_s(r, pos, c);
+                if served > 0.0
+                    && pick.is_none_or(|(s, t, _, _)| {
+                        served > s + 1e-9 || (served >= s - 1e-9 && travel < t - 1e-9)
+                    })
+                {
+                    pick = Some((served, travel, r, c));
+                }
+            }
+        }
+        let Some((served, travel, r, at)) = pick else {
+            return;
+        };
+        // The relay robot gives up its own work while it holds.
+        let hold_s = demand.len() as f64 * cfg.lost_link_timeout_s * 0.5;
+        let cost = travel + self.capacity.utilization(r) * hold_s;
+        let pos = self.world.fleet.get(r).position().unwrap_or(at);
+        let hold_wh = self.reg.idle_wh(r, hold_s.max(7200.0))
+            + cfg.relay_radio_w * hold_s.max(7200.0) / 3600.0;
+        let affordable = Energy::affordable(
+            &self.world,
+            &self.reg,
+            r,
+            self.reg.travel_wh(r, pos, at) + hold_wh,
+            at,
+            cfg,
+        );
+        if served < cfg.relay_benefit_ratio * cost || !affordable {
+            return;
+        }
+        diag.info(now, || {
+            format!(
+                "{} relays at ({},{}): saves about {:.0} s against {:.0} s",
+                self.reg.robot(r).id,
+                at.x,
+                at.y,
+                served,
+                cost
+            )
+        });
+        let planned = drive_use(&self.reg, r, pos, at);
+        let s = sent(&self.world, r, planned.drive_s, planned);
+        let id = self.reg.robot(r).id.clone();
+        round.cmds.push(self.exec.issue(
+            r,
+            &id,
+            Job::Relay { at },
+            Action::Relay { position: at },
+            s,
+        ));
+        round.take(r);
+    }
+
+    /// Whether anything but relay `rr` depends on coverage beyond the base
+    /// station's: a robot whose job ends out there, or one out there now.
+    fn relay_dependents(&self, rr: usize, base: &Coverage) -> bool {
+        let ends_beyond = self.exec.all_active().any(|a| {
+            a.robot != rr
+                && match &a.job {
+                    Job::Work { plan, .. } => !base.covers(plan.end),
+                    Job::Move { to, .. } | Job::Tow { to, .. } => !base.covers(*to),
+                    _ => false,
+                }
+        });
+        let out_there = (0..self.reg.len()).any(|r| {
+            r != rr
+                && self.in_contact(r)
+                && self
+                    .world
+                    .fleet
+                    .get(r)
+                    .position()
+                    .is_some_and(|p| !base.covers(p))
+        });
+        ends_beyond || out_there
+    }
+
+    /// Step 6: robots at their low-water mark charge before anything else.
     /// Returns the robots that cannot reach any charger.
     fn charge_low(&mut self, round: &mut Round, cfg: &Config, diag: &Diag) -> Vec<usize> {
         let mut stranded = Vec::new();
+        if round.blocked.contains("charge") {
+            return stranded;
+        }
         for r in round.free.clone() {
             if !round.free.contains(&r) || !Energy::low(&self.world, &self.reg, r, cfg) {
                 continue;
@@ -1407,6 +2196,9 @@ impl State {
         cfg: &Config,
         diag: &Diag,
     ) -> bool {
+        if round.blocked.contains("move_to") {
+            return false;
+        }
         let e = self.world.fleet.get(r);
         let Some(pos) = e.position() else {
             return false;
@@ -1485,10 +2277,11 @@ impl State {
         Energy::charge_target(&self.world, &self.reg, r, need, cfg)
     }
 
-    /// Step 6: the auction over free robots and interruptible jobs.
+    /// Step 7: the auction over free robots and interruptible jobs.
     fn auction(
         &mut self,
         round: &mut Round,
+        ready: &[Task],
         stranded: &[usize],
         cfg: &Config,
         diag: &Diag,
@@ -1498,7 +2291,13 @@ impl State {
             return AuctionResult::default();
         };
         let busy = self.exec.busy();
-        let tasks = planner.tasks(&self.world, &busy, cfg);
+        // Work whose command the policy holds back is not offered.
+        let tasks: Vec<Task> = ready
+            .iter()
+            .filter(|t| !round.blocked.contains(stage_action(t.stage)))
+            .cloned()
+            .collect();
+        let can_cancel = !round.blocked.contains("cancel");
         let mut crowd: BTreeMap<(CapabilityName, usize), usize> = BTreeMap::new();
         for a in self.exec.all_active() {
             if let Job::Work { task, .. } = &a.job
@@ -1515,10 +2314,16 @@ impl State {
                 robot,
                 roles_only: false,
             })
-            .chain(round.interruptible.iter().map(|&robot| Bidder {
-                robot,
-                roles_only: true,
-            }))
+            .chain(
+                round
+                    .interruptible
+                    .iter()
+                    .filter(|_| can_cancel)
+                    .map(|&robot| Bidder {
+                        robot,
+                        roles_only: true,
+                    }),
+            )
             .collect();
         let result = {
             let ctx = Context {
@@ -1529,9 +2334,21 @@ impl State {
                 cfg,
                 busy: &busy,
                 crowd: &crowd,
+                coverage: &self.coverage,
             };
-            let exec = &self.exec;
-            allocator::auction(&ctx, &bidders, &tasks, &|r, k| exec.cooling(r, k, now))
+            let (exec, held, authority) = (&self.exec, &self.held, &self.authority);
+            // A task held for the robot that had it may go to no other until Earth agrees.
+            let withheld = |r: usize, k: TaskKey| {
+                held.get(&k).is_some_and(|(owner, purpose)| {
+                    *owner != r
+                        && authority
+                            .authorization("reassign_task", purpose, now)
+                            .is_none()
+                })
+            };
+            allocator::auction(&ctx, &bidders, &tasks, &|r, k| {
+                exec.cooling(r, k, now) || withheld(r, k)
+            })
         };
         for award in &result.awards {
             let r = award.robot;
@@ -1621,7 +2438,7 @@ impl State {
                 && need.is_some_and(|need| {
                     need > battery - Energy::reserve_wh(&self.reg, r, pos, cfg)
                 });
-            if blocked || opportunistic {
+            if (blocked || opportunistic) && !round.blocked.contains("charge") {
                 if self.charger_coming(r) {
                     round.take(r);
                     continue;
@@ -1659,7 +2476,7 @@ impl State {
                     continue;
                 }
                 let rescue_underway = self.energy.reserved.values().any(|&client| client == r);
-                if blocked && !rescue_underway {
+                if blocked && !rescue_underway && !round.blocked.contains("move_to") {
                     // Nothing reachable: bring a mobile charger over.
                     let candidates: Vec<usize> =
                         round.free.iter().copied().filter(|&c| c != r).collect();
@@ -1694,6 +2511,7 @@ impl State {
             }
             // An idle mobile charger with a low tank goes to refill it.
             if idle_work
+                && !round.blocked.contains("charge")
                 && let Some(plan) =
                     self.energy
                         .plan_tank_refill(&self.world, &self.reg, r, &round.load)
@@ -1714,7 +2532,11 @@ impl State {
             }
             // Nothing to do: keep enough charge to idle through the night, and
             // take free energy while the bank overflows.
-            if idle_work && !blocked && self.park(round, r, pos, battery, cfg, diag) {
+            if idle_work
+                && !blocked
+                && !round.blocked.contains("charge")
+                && self.park(round, r, pos, battery, cfg, diag)
+            {
                 continue;
             }
             // Wait near the work front if this robot works the pad surface.
@@ -1722,7 +2544,7 @@ impl State {
             let works_front = FRONT_CAPABILITIES
                 .iter()
                 .any(|&c| self.capacity.is_role(r, c, cfg.role_min_share));
-            if !works_front || geom::dist(pos, to) <= 3.0 {
+            if !works_front || geom::dist(pos, to) <= 3.0 || round.blocked.contains("move_to") {
                 continue;
             }
             let trip = self.reg.travel_wh(r, pos, to);
@@ -1832,6 +2654,9 @@ impl State {
     /// (a top-up or a parking charge) holding the last free slot at the
     /// station it would use, so working robots never queue behind idle ones.
     fn preempt_optional(&mut self, round: &mut Round, r: usize, diag: &Diag) {
+        if round.blocked.contains("cancel") {
+            return;
+        }
         let Some(pos) = self.world.fleet.get(r).position() else {
             return;
         };
@@ -1892,6 +2717,29 @@ impl State {
     }
 }
 
+/// Approval purpose for stripping `donor` to restore `target`.
+fn strip_purpose(reg: &Registry, donor: usize, target: usize) -> String {
+    format!("strip {} for {}", reg.robot(donor).id, reg.robot(target).id)
+}
+
+/// Approval purpose for routine actions under `policy`: a standing approval
+/// holds until the policy changes.
+fn routine_purpose(policy: &arcadia_protocol::Policy) -> String {
+    format!("{ROUTINE} under policy {}", policy.policy_version)
+}
+
+/// The robot command a task's stage is carried out with.
+fn stage_action(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Survey | Stage::Verify | Stage::BermCheck | Stage::Recheck => "scan",
+        Stage::Dig => "dig",
+        Stage::Fill | Stage::Berm => "haul",
+        Stage::Grade => "grade",
+        Stage::Compact => "compact",
+        Stage::Sinter => "sinter",
+    }
+}
+
 /// Mobile chargers robot `r` may use now: free ones, plus any reserved for it
 /// that have arrived and are idle.
 fn chargers_for(
@@ -1928,10 +2776,22 @@ fn issue_charge(
     diag: &Diag,
 ) {
     let now = world.now;
+    // Charging from the site's energy reserve waits for Earth's approval.
+    if let ChargeSource::Station(s) = plan.source
+        && let Some(spare) = round.reserve_spare_w.as_mut()
+    {
+        let w = reg.stations()[s].slot_power_w;
+        if *spare < w {
+            round.reserve_wanted = true;
+            return;
+        }
+        *spare -= w;
+    }
     match plan.source {
         ChargeSource::Station(s) => {
             round.load.add(s, now + plan.est_s);
             round.charging_w += reg.stations()[s].slot_power_w;
+            round.station_charges += 1;
         }
         ChargeSource::Mobile(c) => {
             energy.reserved.insert(c, r);
@@ -1997,6 +2857,7 @@ mod tests {
     use crate::diag::Level;
     use crate::registry::tests::{cap, robot, scenario};
     use arcadia_protocol::*;
+    use arcadia_protocol::{CommsCause, Downlink, Link};
 
     fn hello() -> Box<Hello> {
         let mut sc = scenario(vec![
@@ -2425,5 +3286,389 @@ mod tests {
         assert!(!os.world().unwrap().fleet.get(2).operable());
         let cap = os.capacity().unwrap();
         assert_eq!(cap.share(2, CapabilityName::Haul), 0.0);
+    }
+
+    // ----- authority, Earth and coverage -----
+
+    fn level(l: u8) -> AuthorityLevel {
+        AuthorityLevel::try_from(l).unwrap()
+    }
+
+    fn comms(link: Link, cause: CommsCause) -> Event {
+        Event {
+            t: 0.0,
+            kind: EventKind::Comms {
+                link,
+                cause,
+                one_way_delay_s: 720.0,
+                expected_restore_t: None,
+            },
+        }
+    }
+
+    fn earth(t: f64, body: Uplink) -> Event {
+        Event {
+            t,
+            kind: EventKind::EarthMessage {
+                sent_t: t - 720.0,
+                message: EarthToSite {
+                    message_id: format!("earth-{t}"),
+                    body,
+                },
+            },
+        }
+    }
+
+    fn notified(d: &Decision, action: &str) -> Vec<String> {
+        d.to_earth
+            .iter()
+            .filter_map(|m| match &m.body {
+                Downlink::Notify {
+                    action: a,
+                    commands: Some(c),
+                    ..
+                } if a == action => Some(c.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// The crew of `crew_hello` with towing at level 2.
+    fn crew_os_with_tow_at(l: u8) -> Coordinator {
+        let mut h = crew_hello();
+        h.scenario.policy.levels.insert("tow".into(), level(l));
+        let mut os = Coordinator::with_config(Config::default(), Diag::new(Level::Off));
+        os.start(h);
+        os
+    }
+
+    #[test]
+    fn a_level_2_tow_is_notified_in_the_decision_that_orders_it() {
+        let mut os = crew_os_with_tow_at(2);
+        let mut worker = state("worker", 12, 12);
+        worker.status = RobotStatus::Failed;
+        worker.faults = vec![fault("tool", Severity::Disabled, false)];
+        let d = os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal()],
+            robots: vec![worker, state("scout", 6, 6), state("hauler", 8, 8)],
+        });
+        let tow = command_for(&d, "hauler").expect("the hauler tows");
+        assert!(matches!(tow.action, Action::Tow { .. }));
+        assert_eq!(notified(&d, "tow"), vec![tow.command_id.clone()]);
+        // The plan is reported to Earth from the first decision.
+        assert!(d
+            .to_earth
+            .iter()
+            .any(|m| matches!(&m.body, Downlink::StatusReport { progress: Some(p), .. } if p[0].goal_id == "pad")));
+        assert_eq!(os.authority().unwrap().counts.notifies, 1);
+    }
+
+    #[test]
+    fn a_policy_update_counts_from_when_it_arrives() {
+        let mut os = crew_os_with_tow_at(2);
+        let mut worker = state("worker", 12, 12);
+        worker.status = RobotStatus::Failed;
+        worker.faults = vec![fault("tool", Severity::Disabled, false)];
+        let mut loose = os.world().unwrap().policy.clone();
+        loose.policy_version = 2;
+        loose.levels.insert("tow".into(), level(1));
+        let d = os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal(), earth(0.0, Uplink::PolicyUpdate { policy: loose })],
+            robots: vec![worker, state("scout", 6, 6), state("hauler", 8, 8)],
+        });
+        assert!(command_for(&d, "hauler").is_some_and(|c| matches!(c.action, Action::Tow { .. })));
+        assert!(notified(&d, "tow").is_empty(), "towing is level 1 now");
+        assert_eq!(os.world().unwrap().policy.policy_version, 2);
+        // Reprioritizing the one goal is recorded and changes nothing else.
+        let d = os.decide(&Observation {
+            seq: 1,
+            t: 10.0,
+            events: vec![earth(
+                10.0,
+                Uplink::Reprioritize {
+                    priorities: vec![GoalPriority {
+                        goal_id: "pad".into(),
+                        priority: 5,
+                    }],
+                },
+            )],
+            robots: vec![
+                state("worker", 12, 12),
+                state("scout", 6, 6),
+                state("hauler", 8, 8),
+            ],
+        });
+        assert_eq!(d.seq, 1);
+        assert_eq!(os.authority().unwrap().priorities.get("pad"), Some(&5));
+    }
+
+    /// A sinterer and a spare one, both failed beyond field repair, a third
+    /// sinterer working, and a scout that can strip and fit parts. Nothing
+    /// can tow and there is no depot, so parts from the spare are the only
+    /// way to bring the sinterer back.
+    fn strip_os(cannibalize: u8, cfg: Config) -> (Coordinator, Vec<RobotState>) {
+        let sinterer = |id: &str| {
+            robot(
+                id,
+                0.15,
+                vec![cap(CapabilityName::Sinter, 0.01, 60.0, None)],
+            )
+        };
+        let mut sc = scenario(vec![
+            sinterer("worker"),
+            robot(
+                "scout",
+                0.5,
+                vec![
+                    cap(CapabilityName::Scan, 4.0, 0.05, None),
+                    cap(CapabilityName::Repair, 0.0005, 400.0, None),
+                ],
+            ),
+            sinterer("spare"),
+            sinterer("other"),
+        ]);
+        sc.site.width = 30;
+        sc.site.height = 30;
+        sc.site.cell_size_m = 1.0;
+        sc.policy
+            .levels
+            .insert("cannibalize".into(), level(cannibalize));
+        sc.policy.level3.max_wait_s = 3600.0;
+        let mut h = hello();
+        h.scenario = sc;
+        let mut os = Coordinator::with_config(cfg, Diag::new(Level::Off));
+        os.start(h);
+        let mut worker = state("worker", 12, 12);
+        worker.status = RobotStatus::Failed;
+        worker.faults = vec![fault("tool", Severity::Disabled, false)];
+        let mut spare = state("spare", 13, 12);
+        spare.status = RobotStatus::Failed;
+        spare.faults = vec![fault("wheels", Severity::Disabled, false)];
+        let robots = vec![
+            worker,
+            state("scout", 12, 13),
+            spare,
+            state("other", 20, 20),
+        ];
+        (os, robots)
+    }
+
+    fn approval_request(d: &Decision) -> Option<(String, Option<f64>, Option<Fallback>)> {
+        d.to_earth.iter().find_map(|m| match &m.body {
+            Downlink::ApprovalRequest {
+                action,
+                decide_by_t,
+                fallback,
+                ..
+            } if action == "cannibalize" => Some((m.message_id.clone(), *decide_by_t, *fallback)),
+            _ => None,
+        })
+    }
+
+    fn strip_command(d: &Decision) -> Option<&Command> {
+        d.commands
+            .iter()
+            .find(|c| matches!(c.action, Action::Cannibalize { .. }))
+    }
+
+    /// Completion events at `t` for every command in `d`.
+    fn completions(d: &Decision, t: f64) -> Vec<Event> {
+        d.commands
+            .iter()
+            .map(|c| Event {
+                t,
+                kind: EventKind::CommandCompleted {
+                    command_id: c.command_id.clone(),
+                    robot_id: c.robot_id.clone(),
+                    energy_used_wh: 0.0,
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cannibalizing_asks_earth_and_follows_its_answer() {
+        let (mut os, robots) = strip_os(3, Config::default());
+        let d = os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal(), comms(Link::Up, CommsCause::Nominal)],
+            robots: robots.clone(),
+        });
+        let (id, decide_by_t, _) = approval_request(&d).expect("Earth is asked");
+        // A round trip and Earth's thinking time, with margin, within the policy's hour.
+        assert_eq!(decide_by_t, Some(3600.0));
+        assert!(strip_command(&d).is_none(), "not before Earth answers");
+        // Asked once, not again while waiting (the scout finishes its survey meanwhile).
+        let d = os.decide(&Observation {
+            seq: 1,
+            t: 600.0,
+            events: completions(&d, 600.0),
+            robots: robots.clone(),
+        });
+        assert!(approval_request(&d).is_none() && strip_command(&d).is_none());
+        // Earth approves: the strip goes out citing the request.
+        let mut events = completions(&d, 2600.0);
+        events.push(earth(
+            2600.0,
+            Uplink::Approve {
+                request_id: id.clone(),
+                note: None,
+            },
+        ));
+        let d = os.decide(&Observation {
+            seq: 2,
+            t: 2600.0,
+            events,
+            robots: robots.clone(),
+        });
+        let strip = strip_command(&d).expect("the scout strips the spare");
+        assert_eq!(strip.robot_id, "scout");
+        assert_eq!(strip.approval_id, Some(id));
+        assert_eq!(
+            strip.action,
+            Action::Cannibalize {
+                target_robot: "spare".into(),
+                beneficiary_robot: Some("worker".into())
+            }
+        );
+        assert_eq!(os.authority().unwrap().counts.approvals, 1);
+
+        // Vetoed: nothing is stripped.
+        let (mut os, robots) = strip_os(3, Config::default());
+        let d = os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal(), comms(Link::Up, CommsCause::Nominal)],
+            robots: robots.clone(),
+        });
+        let (id, _, _) = approval_request(&d).unwrap();
+        let mut events = completions(&d, 2600.0);
+        events.push(earth(
+            2600.0,
+            Uplink::Veto {
+                request_id: id,
+                note: None,
+            },
+        ));
+        let d = os.decide(&Observation {
+            seq: 1,
+            t: 2600.0,
+            events,
+            robots,
+        });
+        assert!(strip_command(&d).is_none());
+    }
+
+    #[test]
+    fn in_a_blackout_the_fallback_decides_without_waiting() {
+        // Low risk: the rule's fallback is to proceed.
+        let cfg = Config {
+            cannibalize_risk_s: 0.0,
+            ..Config::default()
+        };
+        let (mut os, robots) = strip_os(3, cfg.clone());
+        let d = os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal(), comms(Link::Down, CommsCause::Conjunction)],
+            robots: robots.clone(),
+        });
+        let (id, decide_by_t, fallback) = approval_request(&d).expect("Earth is told");
+        assert_eq!(
+            (decide_by_t, fallback),
+            (Some(0.0), Some(Fallback::Proceed))
+        );
+        assert_eq!(d.wake_at, Some(1.0), "look again at once");
+        let d = os.decide(&Observation {
+            seq: 1,
+            t: 1.0,
+            events: completions(&d, 1.0),
+            robots: robots.clone(),
+        });
+        assert_eq!(
+            strip_command(&d).and_then(|c| c.approval_id.clone()),
+            Some(id)
+        );
+
+        // At level 4 nothing is ever done without Earth: no request it could
+        // not answer in time, and no strip.
+        let (mut os, robots) = strip_os(4, cfg);
+        let d = os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal(), comms(Link::Down, CommsCause::Conjunction)],
+            robots: robots.clone(),
+        });
+        assert!(approval_request(&d).is_none() && strip_command(&d).is_none());
+        let d = os.decide(&Observation {
+            seq: 1,
+            t: 1.0,
+            events: completions(&d, 1.0),
+            robots,
+        });
+        assert!(strip_command(&d).is_none());
+    }
+
+    #[test]
+    fn robots_out_of_contact_are_never_commanded() {
+        let mut os = crew_os();
+        // The hauler's snapshot is stale: it is out of coverage.
+        let mut hauler = state("hauler", 25, 25);
+        hauler.in_relay_coverage = false;
+        hauler.telemetry_t = -100.0;
+        let d = os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal()],
+            robots: vec![state("worker", 6, 7), state("scout", 6, 6), hauler],
+        });
+        assert!(command_for(&d, "hauler").is_none());
+        assert!(
+            command_for(&d, "scout").is_some(),
+            "the scout still surveys"
+        );
+    }
+
+    #[test]
+    fn a_relay_is_stationed_when_work_lies_beyond_coverage() {
+        let mut h = crew_hello();
+        // Only the station's corner is covered: the pad cannot be scanned from inside coverage.
+        h.scenario.base_station.range_m = 1.0;
+        h.scenario.robots.push(robot(
+            "radio",
+            0.5,
+            vec![CapabilitySpec {
+                name: CapabilityName::Relay,
+                rate: 0.0,
+                energy_wh_per_unit: 0.0,
+                capacity: None,
+                range_m: Some(30.0),
+            }],
+        ));
+        let mut os = Coordinator::with_config(Config::default(), Diag::new(Level::Off));
+        os.start(h);
+        let d = os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal()],
+            robots: vec![
+                state("worker", 1, 1),
+                state("scout", 1, 2),
+                state("hauler", 2, 1),
+                state("radio", 2, 2),
+            ],
+        });
+        let relay = command_for(&d, "radio").expect("the relay robot is sent out");
+        let Action::Relay { position } = relay.action else {
+            panic!("{:?}", relay.action)
+        };
+        // It holds inside coverage, reaching the pad from there.
+        assert!(geom::dist(position, GridCoord { x: 0, y: 0 }) <= 1.0);
     }
 }

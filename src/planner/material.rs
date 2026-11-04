@@ -1,13 +1,16 @@
 //! Material balance: where spoil goes and where fill comes from.
 //!
 //! Stockpile sites are cells in a ring just outside the pad (never berm,
-//! station or depot cells). Dig spoil that does not fit in the digger's own
+//! station, depot or berm borrow cells), inside the base station's coverage
+//! when there are enough such cells, so loading never strands a hauler out
+//! of contact. Dig spoil that does not fit in the digger's own
 //! payload is cast onto the nearest site with room; hauls for fill and berm
 //! load from the cheapest site, taking stockpiled spoil first and borrowing
 //! native regolith (to a limited depth) when spoil runs short. The ledger
 //! tracks cut, reuse and borrow so the plan's cut/fill balance is visible.
 
 use crate::config::Config;
+use crate::coverage::Coverage;
 use crate::geom;
 use crate::registry::Registry;
 use crate::world::WorldModel;
@@ -57,9 +60,11 @@ pub struct Material {
 const BORROW_PENALTY_S: f64 = 45.0;
 
 impl Material {
-    /// Choose pile sites around `pad`, avoiding `berm` and infrastructure.
-    pub fn new(pad: &GridRect, berm: &[GridCoord], world: &WorldModel, cfg: &Config) -> Self {
-        let mut blocked: BTreeSet<(u32, u32)> = berm.iter().map(|c| (c.x, c.y)).collect();
+    /// Choose pile sites around `pad`, avoiding `blocked` cells (the berm and
+    /// its borrow cells) and infrastructure, inside base-station coverage
+    /// when at least eight such sites exist within the search.
+    pub fn new(pad: &GridRect, blocked: &[GridCoord], world: &WorldModel, cfg: &Config) -> Self {
+        let mut blocked: BTreeSet<(u32, u32)> = blocked.iter().map(|c| (c.x, c.y)).collect();
         for s in &world.stations {
             blocked.insert((s.position.x, s.position.y));
         }
@@ -67,8 +72,9 @@ impl Material {
             blocked.insert((d.position.x, d.position.y));
         }
         let site = &world.site;
+        let cov = Coverage::new(&world.base_station, site.cell_size_m, &[]);
         let mut picks: Vec<(u32, GridCoord)> = Vec::new();
-        // Widen the search ring until there are enough sites.
+        // Widen the search ring until there are enough covered sites.
         for max_ring in [2u32, 4, 8, 16] {
             picks.clear();
             let lo_x = pad.min.x.saturating_sub(max_ring);
@@ -84,9 +90,12 @@ impl Material {
                     }
                 }
             }
-            if picks.len() >= 8 {
+            if picks.iter().filter(|(_, c)| cov.covers(*c)).count() >= 8 {
                 break;
             }
+        }
+        if picks.iter().filter(|(_, c)| cov.covers(*c)).count() >= 8 {
+            picks.retain(|(_, c)| cov.covers(*c));
         }
         picks.sort_by_key(|&(ring, c)| (ring, c.y, c.x));
         let area = site.cell_area_m2();

@@ -101,6 +101,9 @@ pub struct Task {
     pub elevation_m: f64,
     /// Pad section, for spreading robots of one capability.
     pub section: Option<usize>,
+    /// Digs: the cell the spoil must be cast onto (a berm cell fed from a
+    /// borrow cell), instead of a destination chosen when the dig is awarded.
+    pub cast_to: Option<GridCoord>,
 }
 
 impl Task {
@@ -151,6 +154,7 @@ mod tests {
             max_kg: 0.0,
             elevation_m: 0.0,
             section: None,
+            cast_to: None,
         };
         assert_eq!(t.entry(GridCoord { x: 0, y: 7 }), GridCoord { x: 5, y: 7 });
         assert!(!t.changes_ground());
