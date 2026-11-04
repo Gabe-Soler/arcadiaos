@@ -2,7 +2,7 @@
 
 ArcadiaOS: an operating system for robot crews building on Mars.
 
-ArcadiaOS decides which robot does what, when, and with how much power, while Earth supervises across a 4–24 minute delay and multi-week blackouts. It is measured on [ArcadiaBench](https://github.com/Gabe-Soler/ArcadiaBench), and it talks to the world only through [arcadia-protocol](https://github.com/Gabe-Soler/arcadia-protocol). That means the same coordinator can drive the simulator now and real hardware later.
+ArcadiaOS decides which robot does what, when, and with how much power, while Earth supervises across a 4–24 minute delay and multi-week blackouts. It is measured on [ArcadiaBench](https://github.com/Gabe-Soler/arcadiabench), and it talks to the world only through [arcadia-protocol](https://github.com/Gabe-Soler/arcadia-protocol). That means the same coordinator can drive the simulator now and real hardware later.
 
 **Version 1.0.0**, speaking arcadia-protocol 1.0.0. It builds the landing pad of every ArcadiaBench 1.0 scenario, with any of the benchmark's crews, and has the best headline score in all 18 ([results](#results)).
 
@@ -31,17 +31,17 @@ Robots are described only by their capabilities, so roles emerge from allocation
 
 ## Run it under ArcadiaBench
 
-ArcadiaOS is a coordinator process that speaks newline-delimited JSON on stdin/stdout; a simulator launches it. With Rust (stable) installed and [ArcadiaBench](https://github.com/Gabe-Soler/ArcadiaBench) checked out beside this repository, from this repository's root:
+ArcadiaOS is a coordinator process that speaks newline-delimited JSON on stdin/stdout; a simulator launches it. With Rust (stable) installed and [ArcadiaBench](https://github.com/Gabe-Soler/arcadiabench) checked out beside this repository, from this repository's root:
 
 ```sh
 cargo build --release
-(cd ../ArcadiaBench && cargo build --release)
+(cd ../arcadiabench && cargo build --release)
 
 # One run: Small crew, nominal conditions, seed 1, with its event log.
-../ArcadiaBench/target/release/arcadiabench run --seed 1 --log run.jsonl -- ./target/release/arcadiaos
+../arcadiabench/target/release/arcadiabench run --seed 1 --log run.jsonl -- ./target/release/arcadiaos
 
 # Ten seeds of the Medium crew through a conjunction blackout, scored.
-../ArcadiaBench/target/release/arcadiabench bench --preset medium --variant conjunction --seeds 1-10 --out runs/medium-conjunction -- ./target/release/arcadiaos
+../arcadiabench/target/release/arcadiabench bench --preset medium --variant conjunction --seeds 1-10 --out runs/medium-conjunction -- ./target/release/arcadiaos
 ```
 
 Each run prints a one-line summary, and `bench` prints its scorecard. ArcadiaBench's README covers every preset, variant and command, its replay viewer opens any saved log, and its `scripts/results.sh` reproduces the full benchmark results with this binary (it looks for it at `../arcadiaos/target/release/arcadiaos`, or wherever `ARCADIAOS` says).
@@ -50,7 +50,7 @@ ArcadiaOS writes nothing to stderr by default. Set `ARCADIAOS_LOG=info` for plan
 
 ## Results
 
-On ArcadiaBench 1.0 ([`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/ArcadiaBench/blob/v1.0.0/results/v1.0/RESULTS.md)), every preset and variant over seeds 1–50, ArcadiaOS completes all 900 of its runs, with no policy violation and no robot lost, and has the best headline (success rate × speed) in all 18 scenarios, 10–21% above the greedy baseline's:
+On ArcadiaBench 1.0 ([`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/arcadiabench/blob/v1.0.0/results/v1.0/RESULTS.md)), every preset and variant over seeds 1–50, ArcadiaOS completes all 900 of its runs, with no policy violation and no robot lost, and has the best headline (success rate × speed) in all 18 scenarios, 10–21% above the greedy baseline's:
 
 | Nominal headline | Small (4 robots) | Medium (10) | Large (20) |
 |---|---|---|---|
@@ -63,7 +63,7 @@ On ArcadiaBench 1.0 ([`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/A
 - Its suite resilience is 0.975, against greedy's 0.967.
 - Decisions take a fraction of a millisecond, and runs on the same seed are byte-identical.
 
-ArcadiaBench's [demo replays](https://github.com/Gabe-Soler/ArcadiaBench/blob/v1.0.0/docs/demos.md) show ArcadiaOS through a nominal build, a dust storm, a conjunction blackout and cascading faults. [docs/architecture.md](docs/architecture.md#results) discusses where the time goes.
+ArcadiaBench's [demo replays](https://github.com/Gabe-Soler/arcadiabench/blob/main/docs/demos.md) show ArcadiaOS through a nominal build, a dust storm, a conjunction blackout and cascading faults. [docs/architecture.md](docs/architecture.md#results) discusses where the time goes.
 
 ## Develop
 
@@ -74,7 +74,7 @@ cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
 # End to end against ArcadiaBench (skipped unless ARCADIABENCH is set):
-ARCADIABENCH=../ArcadiaBench/target/release/arcadiabench cargo test --release --test bench
+ARCADIABENCH=../arcadiabench/target/release/arcadiabench cargo test --release --test bench
 ```
 
 CI runs the checks above. A separate job builds ArcadiaBench at the commit pinned in `BENCH_REF` and runs the end-to-end tests (the `nominal` and `conjunction` variants) against it.

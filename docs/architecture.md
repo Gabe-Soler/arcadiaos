@@ -358,7 +358,7 @@ ArcadiaOS never issues a command that would complete instantly, such as a move t
 
 ## Results
 
-ArcadiaBench 1.0 benchmarks ArcadiaOS 1.0 and its three baseline coordinators on every preset and variant, seeds 1–50, in release; its [`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/ArcadiaBench/blob/v1.0.0/results/v1.0/RESULTS.md) has every scorecard. Headline (success rate × mean speed), nominal variant:
+ArcadiaBench 1.0 benchmarks ArcadiaOS 1.0 and its three baseline coordinators on every preset and variant, seeds 1–50, in release; its [`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/arcadiabench/blob/v1.0.0/results/v1.0/RESULTS.md) has every scorecard. Headline (success rate × mean speed), nominal variant:
 
 | Coordinator | Small | Medium | Large |
 |---|---|---|---|
@@ -374,7 +374,7 @@ ArcadiaBench 1.0 benchmarks ArcadiaOS 1.0 and its three baseline coordinators on
 - **Where the time goes.** On Small the build is bound by the single compactor-sinterer, which needs about 26 kWh for the pad, three times its battery, so about six hours of a 0.81-sol build go on charging. On Medium and Large it is the compactor-sinterers' driving between cells, which the feeding-step rule in [Dispatch](#dispatch-sequential-auction) cuts: on seeds 1–20 it raised the Large nominal headline from 0.651 to 0.706 and Medium's from 0.736 to 0.750, and left Small, with one compactor-sinterer, unchanged.
 - Decisions take a fraction of a millisecond: whole Large runs average under 0.14 ms a decision, simulator included. Runs on the same seed are byte-identical.
 
-ArcadiaBench's [demo replays](https://github.com/Gabe-Soler/ArcadiaBench/blob/v1.0.0/docs/demos.md) show ArcadiaOS through a nominal build, a dust storm, a conjunction blackout and cascading faults.
+ArcadiaBench's [demo replays](https://github.com/Gabe-Soler/arcadiabench/blob/main/docs/demos.md) show ArcadiaOS through a nominal build, a dust storm, a conjunction blackout and cascading faults.
 
 ## Extension points
 

@@ -35,7 +35,7 @@ jobs:
       - name: Check out ArcadiaBench
         uses: actions/checkout@v7
         with:
-          repository: Gabe-Soler/ArcadiaBench
+          repository: Gabe-Soler/arcadiabench
           ref: ${{ env.BENCH_REF }}
           path: bench
       - uses: dtolnay/rust-toolchain@stable
