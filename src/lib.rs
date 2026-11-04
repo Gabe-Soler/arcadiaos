@@ -1,37 +1,45 @@
 //! ArcadiaOS: the coordinator for robot crews building on Mars.
 //!
-//! Week-1 scaffold: [`run`] implements the protocol session (handshake,
-//! observation → decision loop, end) with a [`Coordinator`] that does not plan
-//! yet. Task allocation and scheduling arrive in weeks 3–4.
+//! [`run`] implements the protocol session (handshake, observation → decision
+//! loop, end) around a [`Coordinator`], which turns the landing-pad goal into
+//! work for the whole crew:
+//!
+//! - [`world`]: the world model, built only from `hello` and observations;
+//! - [`registry`]: the capability registry (who can do what, how fast, at what cost);
+//! - [`planner`]: goal → per-cell task graph, material balance, berm, verification and rework;
+//! - [`capacity`] and [`lp`]: the capacity plan, a small linear program for each robot's roles;
+//! - [`allocator`]: a deterministic sequential auction that assigns ready tasks;
+//! - [`energy`]: reserves, charging decisions, station contention and the mobile charger;
+//! - [`executor`]: the command lifecycle, retries and cancellation;
+//! - [`coordinator`]: one decision per observation, tying the rest together.
+//!
+//! Decisions are deterministic: the same inputs always give the same commands.
+
+pub mod allocator;
+pub mod capacity;
+pub mod config;
+pub mod coordinator;
+pub mod diag;
+pub mod energy;
+pub mod executor;
+pub mod geom;
+pub mod lp;
+pub mod planner;
+pub mod registry;
+pub mod tasks;
+pub mod world;
+
+pub use config::Config;
+pub use coordinator::{Coordinator, Summary};
 
 use arcadia_protocol::{
-    CoordinatorToSim, Decision, EndReason, ErrorCode, ErrorMessage, Hello, Observation,
-    PROTOCOL_VERSION, SimToCoordinator, SoftwareInfo, Welcome, is_compatible, wire,
+    CoordinatorToSim, EndReason, ErrorCode, ErrorMessage, PROTOCOL_VERSION, SimToCoordinator,
+    SoftwareInfo, Welcome, is_compatible, wire,
 };
 use std::fmt;
 use std::io::{BufRead, Write};
 
-/// Decision-making core. The session loop in [`run`] feeds it observations.
-#[derive(Debug, Default)]
-pub struct Coordinator {
-    hello: Option<Box<Hello>>,
-}
-
-impl Coordinator {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn start(&mut self, hello: Box<Hello>) {
-        self.hello = Some(hello);
-    }
-
-    /// Placeholder policy: acknowledge every observation without acting.
-    pub fn decide(&mut self, obs: &Observation) -> Decision {
-        Decision::empty(obs.seq)
-    }
-}
-
+/// Name and version reported in `welcome`.
 pub fn software_info() -> SoftwareInfo {
     SoftwareInfo {
         name: "arcadiaos".into(),
@@ -39,15 +47,21 @@ pub fn software_info() -> SoftwareInfo {
     }
 }
 
+/// What happened in a session.
 #[derive(Debug, Default, PartialEq)]
 pub struct RunSummary {
+    /// Run id from `hello`.
     pub run_id: Option<String>,
+    /// Decisions sent.
     pub decisions: u64,
+    /// Why the simulator ended the run, if it did.
     pub end_reason: Option<EndReason>,
 }
 
+/// Why a session failed.
 #[derive(Debug)]
 pub enum RunError {
+    /// Reading or writing the stream failed.
     Wire(wire::WireError),
     /// The simulator broke the protocol; an `error` message was sent back.
     Protocol(String),
@@ -74,8 +88,16 @@ impl From<wire::WireError> for RunError {
 }
 
 /// Run one protocol session until the simulator sends `end` or closes the stream.
-pub fn run<R: BufRead, W: Write>(mut input: R, mut output: W) -> Result<RunSummary, RunError> {
-    let mut coordinator = Coordinator::new();
+pub fn run<R: BufRead, W: Write>(input: R, output: W) -> Result<RunSummary, RunError> {
+    run_with(Coordinator::new(), input, output)
+}
+
+/// [`run`] with a preconfigured coordinator.
+pub fn run_with<R: BufRead, W: Write>(
+    mut coordinator: Coordinator,
+    mut input: R,
+    mut output: W,
+) -> Result<RunSummary, RunError> {
     let mut summary = RunSummary::default();
     let mut started = false;
 
@@ -141,6 +163,7 @@ pub fn run<R: BufRead, W: Write>(mut input: R, mut output: W) -> Result<RunSumma
                 summary.decisions += 1;
             }
             SimToCoordinator::End(end) => {
+                coordinator.finish(&end);
                 summary.end_reason = Some(end.reason);
                 return Ok(summary);
             }
