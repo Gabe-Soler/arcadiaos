@@ -37,7 +37,9 @@ fn state(id: &str, x: u32, y: u32) -> RobotState {
             dust_coverage: 0.0,
             temperature_c: -50.0,
         },
+        faults: vec![],
         in_relay_coverage: true,
+        telemetry_t: 0.0,
     }
 }
 
@@ -268,6 +270,18 @@ fn berm_is_surveyed_built_and_confirmed() {
     p.after_scan(&w, &check, &cfg);
     assert!(p.berm[0].confirmed);
     assert_eq!(p.berm_need_kg(&w, 0, &cfg), 0.0);
+
+    // A recheck asks for one more load; delivering it lets the check follow
+    // instead of hauling to the cell for ever.
+    p.berm[0].confirmed = false;
+    p.berm[0].extra_kg = 75.0;
+    assert!(p.berm_need_kg(&w, 0, &cfg) >= 75.0);
+    w.site.record_deposit(berm[0], 75.0, true, 4.0, &cfg);
+    p.record_berm_deposit(0, 75.0);
+    assert_eq!(p.berm[0].extra_kg, 0.0);
+    assert!(p.berm_need_kg(&w, 0, &cfg) < cfg.min_haul_kg);
+    let tasks = p.tasks(&w, &Busy::default(), &cfg);
+    assert!(tasks.iter().any(|t| t.key == TaskKey::BermCheck));
 }
 
 #[test]

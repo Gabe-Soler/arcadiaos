@@ -7,8 +7,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # ArcadiaBench revision the integration job runs against: pinned to the
-  # week-2 simulator (protocol v0.1.0) that this coordinator speaks.
-  BENCH_REF: ffa8a66f0622d7e78e80de256c4cef07acf3a8b0
+  # week-5 simulator (faults, wear, repair options and energy modes; protocol
+  # v0.2.0) that this coordinator speaks. The integration tests run the
+  # `nominal` variant.
+  BENCH_REF: 6f4e1b2bb304352a094b77b21456738e70845dbc
 
 jobs:
   check:

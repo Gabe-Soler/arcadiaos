@@ -129,7 +129,6 @@ pub fn plan_work(ctx: &Context, r: usize, t: &Task) -> Result<WorkPlan, NoBid> {
     if !reg.can(r, cap) {
         return Err(NoBid::Unable);
     }
-    let idle_w = reg.robot(r).idle_w;
     let plan = match t.stage {
         Stage::Survey | Stage::Verify | Stage::BermCheck | Stage::Recheck => {
             let at = t.entry(pos);
@@ -188,7 +187,7 @@ pub fn plan_work(ctx: &Context, r: usize, t: &Task) -> Result<WorkPlan, NoBid> {
                 dig,
             }
         }
-        Stage::Fill | Stage::Berm => plan_haul(ctx, r, t, pos, idle_w)?,
+        Stage::Fill | Stage::Berm => plan_haul(ctx, r, t, pos)?,
     };
     if !plan.duration_s.is_finite() {
         return Err(NoBid::Unable);
@@ -199,13 +198,7 @@ pub fn plan_work(ctx: &Context, r: usize, t: &Task) -> Result<WorkPlan, NoBid> {
     Ok(plan)
 }
 
-fn plan_haul(
-    ctx: &Context,
-    r: usize,
-    t: &Task,
-    pos: GridCoord,
-    idle_w: f64,
-) -> Result<WorkPlan, NoBid> {
+fn plan_haul(ctx: &Context, r: usize, t: &Task, pos: GridCoord) -> Result<WorkPlan, NoBid> {
     let reg = ctx.reg;
     let capacity = reg.haul_capacity_kg(r);
     let rate = reg.rate(r, CapabilityName::Haul);
@@ -236,7 +229,7 @@ fn plan_haul(
     let energy = reg.travel_wh(r, pos, from)
         + reg.travel_wh(r, from, dest)
         + (load + mass) * e_unit
-        + handle_s * idle_w / 3600.0;
+        + reg.idle_wh(r, handle_s);
     Ok(WorkPlan {
         action: Action::Haul {
             from,

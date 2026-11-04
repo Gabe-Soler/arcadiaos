@@ -2,9 +2,11 @@
 //!
 //! Two kinds of numbers live here. *Interface assumptions* describe work
 //! semantics that the protocol does not carry in `hello` (for example how far
-//! grading can level a cell); they come from the interface semantics and are
-//! deliberately conservative. *Policy knobs* tune how ArcadiaOS plans. Nothing
-//! here is specific to a seed, a crew or a site.
+//! grading can level a cell, how long a depot service takes, or how health
+//! telemetry relates to wear); they come from the interface semantics and the
+//! reference simulator's documentation and are deliberately conservative.
+//! *Policy knobs* tune how ArcadiaOS plans. Nothing here is specific to a
+//! seed, a crew or a site.
 
 /// Every assumption and tuning knob ArcadiaOS uses.
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +88,119 @@ pub struct Config {
     pub idle_wake_s: f64,
     /// Remaining unfinished pad cells at which the end game starts.
     pub endgame_cells: usize,
+
+    // ----- repair, tow and service (interface assumptions) -----
+    /// Tow speed as a fraction of the tower's speed.
+    pub tow_speed_factor: f64,
+    /// Tow drive energy as a multiple of the tower's own.
+    pub tow_energy_factor: f64,
+    /// Depot service time until a service acceptance reveals it, s.
+    pub service_s: f64,
+    /// Robots a depot services at once.
+    pub depot_capacity: u32,
+    /// Repair work per disabled field-repairable fault, units.
+    pub repair_units_disabled: f64,
+    /// Repair work per degraded fault, units.
+    pub repair_units_degraded: f64,
+    /// Repair work to free a stuck robot, units.
+    pub repair_units_stuck: f64,
+    /// Repair work per unit of summed component wear, units.
+    pub repair_units_per_wear: f64,
+    /// Fraction of every component's wear a field repair removes.
+    pub repair_wear_cut: f64,
+    /// Most of a repairer's battery one repair may use.
+    pub repair_max_battery_frac: f64,
+
+    // ----- health model (interface assumptions) -----
+    /// Per-observation smoothing weight of health telemetry.
+    pub health_alpha: f64,
+    /// Per-observation smoothing weight of health telemetry trends.
+    pub health_beta: f64,
+    /// Wheel slip of a healthy robot.
+    pub slip_base: f64,
+    /// Wheel slip per unit of wheel wear.
+    pub slip_per_wear: f64,
+    /// Extra wheel slip while the wheels have a fault.
+    pub slip_fault: f64,
+    /// Motor current ratio per unit of drive-motor wear.
+    pub current_per_wear: f64,
+    /// Extra motor current ratio while the drive motor has a fault.
+    pub current_fault: f64,
+    /// Dust coverage per unit of joint wear.
+    pub dust_per_joint_wear: f64,
+    /// Dust coverage per unit of sensor wear.
+    pub dust_per_sensor_wear: f64,
+    /// Nominal wheel wear per km driven (scaled by the observed site rate).
+    pub wear_wheels_per_km: f64,
+    /// Nominal drive-motor wear per km driven.
+    pub wear_drive_per_km: f64,
+    /// Nominal tool wear per hour of work (scans excluded).
+    pub wear_tool_per_work_h: f64,
+    /// Nominal joint wear per hour of work.
+    pub wear_joints_per_work_h: f64,
+    /// Nominal sensor wear per exposed hour outdoors.
+    pub wear_sensors_per_exposed_h: f64,
+    /// Nominal battery wear per kWh drawn.
+    pub wear_battery_per_kwh: f64,
+    /// Fault hazard per exposed hour of one component at wear `w`, as `k · w³`.
+    pub wear_hazard_per_h: f64,
+    /// Driving speed lost per unit of wheel wear (fraction).
+    pub wear_speed_loss: f64,
+    /// Drive energy gained per unit of drive-motor wear (fraction).
+    pub wear_drive_energy_gain: f64,
+    /// Work rate lost per unit of joint or tool wear (fraction, each).
+    pub wear_work_rate_loss: f64,
+    /// Work energy gained per unit of tool wear (fraction).
+    pub wear_work_energy_gain: f64,
+    /// Scan rate lost per unit of sensor wear (fraction).
+    pub wear_scan_rate_loss: f64,
+    /// Energy gained on everything per unit of battery wear (fraction).
+    pub wear_energy_gain: f64,
+    /// Slip penalty of a degraded wheel fault on speed (factor).
+    pub degraded_speed_factor: f64,
+    /// Drive energy factor of a degraded drive-motor fault.
+    pub degraded_drive_energy_factor: f64,
+    /// Work rate factor of each degraded joints or tool fault.
+    pub degraded_work_rate_factor: f64,
+    /// Work energy factor of a degraded tool fault.
+    pub degraded_work_energy_factor: f64,
+    /// Scan rate factor of a degraded sensor fault.
+    pub degraded_scan_rate_factor: f64,
+    /// Energy factor of a degraded battery fault, on everything.
+    pub degraded_energy_factor: f64,
+
+    // ----- predictive maintenance -----
+    /// Expected cost of one fault in the faulty robot's time, s.
+    pub fault_cost_s: f64,
+    /// Maintenance at a natural break when benefit ≥ this × cost.
+    pub maint_break_ratio: f64,
+    /// Maintenance that interrupts work when benefit ≥ this × cost.
+    pub maint_urgent_ratio: f64,
+    /// Smallest expected benefit worth a maintenance stop, s.
+    pub maint_min_benefit_s: f64,
+    /// Fixed cost of any maintenance stop (broken work flow, waiting for
+    /// the helper, its trip back), s.
+    pub maint_overhead_s: f64,
+    /// Fault risk is projected this far ahead: maintenance can always be done
+    /// later, so risk further out does not argue for acting now, h.
+    pub maint_horizon_h: f64,
+
+    // ----- nights and the site grid -----
+    /// Heater draw on cold nights, as a multiple of idle power.
+    pub heater_idle_factor: f64,
+    /// Cold window assumed to start at this sol phase …
+    pub cold_from_phase: f64,
+    /// … and to end at this sol phase the next morning.
+    pub cold_to_phase: f64,
+    /// A robot with no work left keeps enough charge to idle this long, s.
+    pub park_horizon_s: f64,
+    /// Non-urgent station charging waits while the site bank is projected
+    /// below this fraction before the next sunrise.
+    pub bank_floor_frac: f64,
+    /// Above this bank fraction in daylight surplus, free robots top up.
+    pub bank_surplus_frac: f64,
+    /// Battery fraction below which a free robot tops up in a surplus window.
+    pub surplus_charge_frac: f64,
 }
 
 impl Default for Config {
@@ -129,6 +244,61 @@ impl Default for Config {
             max_same_time_decisions: 50,
             idle_wake_s: 900.0,
             endgame_cells: 8,
+
+            tow_speed_factor: 0.5,
+            tow_energy_factor: 2.0,
+            service_s: 7200.0,
+            depot_capacity: 1,
+            repair_units_disabled: 1.0,
+            repair_units_degraded: 0.25,
+            repair_units_stuck: 0.5,
+            repair_units_per_wear: 0.15,
+            repair_wear_cut: 0.5,
+            repair_max_battery_frac: 0.8,
+
+            health_alpha: 0.05,
+            health_beta: 0.01,
+            slip_base: 0.02,
+            slip_per_wear: 0.3,
+            slip_fault: 0.15,
+            current_per_wear: 0.6,
+            current_fault: 0.3,
+            dust_per_joint_wear: 0.6,
+            dust_per_sensor_wear: 0.4,
+            wear_wheels_per_km: 0.08,
+            wear_drive_per_km: 0.06,
+            wear_tool_per_work_h: 0.02,
+            wear_joints_per_work_h: 0.012,
+            wear_sensors_per_exposed_h: 0.006,
+            wear_battery_per_kwh: 0.006,
+            wear_hazard_per_h: 0.05,
+            wear_speed_loss: 0.3,
+            wear_drive_energy_gain: 0.3,
+            wear_work_rate_loss: 0.2,
+            wear_work_energy_gain: 0.2,
+            wear_scan_rate_loss: 0.3,
+            wear_energy_gain: 0.15,
+            degraded_speed_factor: 0.7,
+            degraded_drive_energy_factor: 1.4,
+            degraded_work_rate_factor: 0.75,
+            degraded_work_energy_factor: 1.25,
+            degraded_scan_rate_factor: 0.5,
+            degraded_energy_factor: 1.25,
+
+            fault_cost_s: 3600.0,
+            maint_break_ratio: 1.0,
+            maint_urgent_ratio: 2.0,
+            maint_min_benefit_s: 600.0,
+            maint_overhead_s: 900.0,
+            maint_horizon_h: 4.0,
+
+            heater_idle_factor: 1.0,
+            cold_from_phase: 0.9,
+            cold_to_phase: 0.35,
+            park_horizon_s: 43_200.0,
+            bank_floor_frac: 0.25,
+            bank_surplus_frac: 0.9,
+            surplus_charge_frac: 0.9,
         }
     }
 }

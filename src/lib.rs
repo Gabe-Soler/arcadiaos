@@ -10,6 +10,10 @@
 //! - [`capacity`] and [`lp`]: the capacity plan, a small linear program for each robot's roles;
 //! - [`allocator`]: a deterministic sequential auction that assigns ready tasks;
 //! - [`energy`]: reserves, charging decisions, station contention and the mobile charger;
+//! - [`power`]: the site bank forecast and cold nights;
+//! - [`health`]: wear estimates from telemetry and usage, performance factors and the
+//!   predictive-maintenance rule;
+//! - [`recovery`]: getting stuck, failed and offline robots back to work;
 //! - [`executor`]: the command lifecycle, retries and cancellation;
 //! - [`coordinator`]: one decision per observation, tying the rest together.
 //!
@@ -23,8 +27,11 @@ pub mod diag;
 pub mod energy;
 pub mod executor;
 pub mod geom;
+pub mod health;
 pub mod lp;
 pub mod planner;
+pub mod power;
+pub mod recovery;
 pub mod registry;
 pub mod tasks;
 pub mod world;

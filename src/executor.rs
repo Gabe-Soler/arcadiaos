@@ -3,8 +3,9 @@
 //! Turns jobs into protocol commands with deterministic ids, tracks each one
 //! from issue through accepted to completed, failed or rejected, and hands
 //! the outcome back with the job it belonged to. It also owns retry back-off
-//! (so a rejected task is not re-sent in a tight loop at one sim time) and
-//! cancellation of interruptible jobs.
+//! (so a rejected task is not re-sent in a tight loop at one sim time),
+//! cancellation of interruptible jobs, and which robots in-flight commands
+//! engage (repair, tow and charge targets cannot take commands of their own).
 
 use crate::allocator::WorkPlan;
 use crate::energy::ChargePlan;
@@ -39,6 +40,49 @@ pub enum Job {
         /// Mobile charger heading to a stranded client.
         rescue_for: Option<usize>,
     },
+    /// Field repair of another robot: clears field-repairable faults, frees
+    /// it if stuck and cuts its wear.
+    Repair {
+        /// The robot being repaired.
+        target: usize,
+        /// Maintenance of a working robot rather than recovery of a disabled one.
+        preventive: bool,
+    },
+    /// Tow a disabled robot somewhere it can be helped.
+    Tow {
+        /// The robot being towed.
+        target: usize,
+        /// Destination cell.
+        to: GridCoord,
+        /// What the target needs there.
+        purpose: TowPurpose,
+    },
+    /// Depot service: clears every fault, resets wear, frees a stuck robot.
+    Service {
+        /// Depot index.
+        depot: usize,
+        /// Maintenance of a working robot rather than recovery of a disabled one.
+        preventive: bool,
+    },
+    /// Strip a disabled robot for parts to restore another. Only issued when
+    /// the policy allows it without Earth's approval.
+    Cannibalize {
+        /// The robot stripped (lost afterwards).
+        target: usize,
+        /// The robot that receives the parts.
+        beneficiary: usize,
+    },
+}
+
+/// Why a robot is being towed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TowPurpose {
+    /// To a depot for service.
+    Depot(usize),
+    /// To a station to recharge an empty battery.
+    Station(usize),
+    /// Out of soft ground; the tow itself frees it.
+    Free,
 }
 
 impl Job {
@@ -72,8 +116,87 @@ impl Job {
                 }
             ),
             Job::Move { to, .. } => format!("move to ({},{})", to.x, to.y),
+            Job::Repair { target, preventive } => format!(
+                "repair robot #{target}{}",
+                if *preventive { " (preventive)" } else { "" }
+            ),
+            Job::Tow {
+                target,
+                to,
+                purpose,
+            } => format!("tow robot #{target} to ({},{}) {purpose:?}", to.x, to.y),
+            Job::Service { depot, preventive } => format!(
+                "service at depot #{depot}{}",
+                if *preventive { " (preventive)" } else { "" }
+            ),
+            Job::Cannibalize {
+                target,
+                beneficiary,
+            } => format!("cannibalize robot #{target} for robot #{beneficiary}"),
         }
     }
+
+    /// Robots this job engages besides the one running it: repair, tow and
+    /// strip targets, the beneficiary of parts, and a mobile charger in use.
+    pub fn engages(&self) -> Vec<usize> {
+        match self {
+            Job::Repair { target, .. } | Job::Tow { target, .. } => vec![*target],
+            Job::Cannibalize {
+                target,
+                beneficiary,
+            } => vec![*target, *beneficiary],
+            Job::Charge { plan, .. } => match plan.source {
+                crate::energy::ChargeSource::Mobile(c) => vec![c],
+                crate::energy::ChargeSource::Station(_) => vec![],
+            },
+            Job::Work { .. } | Job::Move { .. } | Job::Service { .. } => vec![],
+        }
+    }
+}
+
+/// Planned exposure of a command, for the health model.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlannedUse {
+    /// Driving, m (towing included).
+    pub drive_m: f64,
+    /// Driving time, s.
+    pub drive_s: f64,
+    /// Work time other than scanning, s.
+    pub work_s: f64,
+    /// Scanning time, s.
+    pub scan_s: f64,
+    /// Calibration factor the energy estimate carried.
+    pub energy_factor: f64,
+    /// Calibration factor the duration estimate carried.
+    pub duration_factor: f64,
+}
+
+impl Default for PlannedUse {
+    fn default() -> Self {
+        Self {
+            drive_m: 0.0,
+            drive_s: 0.0,
+            work_s: 0.0,
+            scan_s: 0.0,
+            energy_factor: 1.0,
+            duration_factor: 1.0,
+        }
+    }
+}
+
+/// What the coordinator knew when it sent a command.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Sent {
+    /// Decision time.
+    pub now: f64,
+    /// Expected duration, s.
+    pub est_s: f64,
+    /// Battery, Wh.
+    pub battery_wh: f64,
+    /// Payload, kg.
+    pub payload_kg: f64,
+    /// Planned exposure.
+    pub planned: PlannedUse,
 }
 
 /// A command in flight.
@@ -93,8 +216,12 @@ pub struct Assignment {
     pub battery_wh: f64,
     /// Payload when sent, kg.
     pub payload_kg: f64,
+    /// Planned exposure.
+    pub planned: PlannedUse,
     /// The simulator acknowledged it.
     pub accepted: bool,
+    /// The simulator's estimate from `command_accepted`, s.
+    pub accepted_est_s: Option<f64>,
 }
 
 impl Assignment {
@@ -127,6 +254,8 @@ pub enum Outcome {
         reason: FailReason,
         /// Simulator detail.
         detail: Option<String>,
+        /// Energy the robot used before it stopped, Wh.
+        energy_used_wh: f64,
     },
     /// Refused at submission.
     Rejected {
@@ -197,17 +326,13 @@ impl Executor {
     }
 
     /// Send `job` to robot `r` as `action`.
-    #[allow(clippy::too_many_arguments)]
     pub fn issue(
         &mut self,
         r: usize,
         robot_id: &str,
         job: Job,
         action: Action,
-        now: f64,
-        est_s: f64,
-        battery_wh: f64,
-        payload_kg: f64,
+        sent: Sent,
     ) -> Command {
         let id = self.next_command_id();
         self.stats.issued += 1;
@@ -218,11 +343,13 @@ impl Executor {
                 robot: r,
                 command_id: id.clone(),
                 job,
-                issued_t: now,
-                est_end_t: now + est_s.max(0.0),
-                battery_wh,
-                payload_kg,
+                issued_t: sent.now,
+                est_end_t: sent.now + sent.est_s.max(0.0),
+                battery_wh: sent.battery_wh,
+                payload_kg: sent.payload_kg,
+                planned: sent.planned,
                 accepted: false,
+                accepted_est_s: None,
             },
         );
         Command {
@@ -253,6 +380,12 @@ impl Executor {
         Some((cmd, a))
     }
 
+    /// The in-flight assignment of command `command_id`.
+    pub fn assignment_of(&self, command_id: &str) -> Option<&Assignment> {
+        let r = self.by_command.get(command_id)?;
+        self.active.get(r)
+    }
+
     /// When the in-flight command `command_id` was issued (scan results
     /// arrive before their command completes).
     pub fn issued_t(&self, command_id: &str) -> Option<f64> {
@@ -260,14 +393,29 @@ impl Executor {
         self.active.get(r).map(|a| a.issued_t)
     }
 
+    /// Robots engaged by in-flight commands of other robots.
+    pub fn engaged(&self) -> BTreeSet<usize> {
+        self.active.values().flat_map(|a| a.job.engages()).collect()
+    }
+
+    /// The in-flight command that engages robot `r`, if any.
+    pub fn engaging(&self, r: usize) -> Option<&Assignment> {
+        self.active.values().find(|a| a.job.engages().contains(&r))
+    }
+
     /// Track a lifecycle event; returns the finished job and its outcome.
     pub fn on_event(&mut self, e: &Event) -> Option<(Assignment, Outcome)> {
         let (id, outcome) = match &e.kind {
-            EventKind::CommandAccepted { command_id, .. } => {
+            EventKind::CommandAccepted {
+                command_id,
+                estimated_duration_s,
+                ..
+            } => {
                 if let Some(&r) = self.by_command.get(command_id)
                     && let Some(a) = self.active.get_mut(&r)
                 {
                     a.accepted = true;
+                    a.accepted_est_s = Some(*estimated_duration_s);
                     self.streak.remove(&r);
                 }
                 return None;
@@ -286,12 +434,14 @@ impl Executor {
                 command_id,
                 reason,
                 detail,
+                energy_used_wh,
                 ..
             } => (
                 command_id,
                 Outcome::Failed {
                     reason: *reason,
                     detail: detail.clone(),
+                    energy_used_wh: *energy_used_wh,
                 },
             ),
             EventKind::CommandRejected {
@@ -429,13 +579,23 @@ mod tests {
         Event { t: 10.0, kind }
     }
 
+    fn sent(est_s: f64) -> Sent {
+        Sent {
+            now: 0.0,
+            est_s,
+            battery_wh: 100.0,
+            payload_kg: 0.0,
+            planned: PlannedUse::default(),
+        }
+    }
+
     #[test]
     fn lifecycle_from_issue_to_completion() {
         let mut ex = Executor::new();
         let Job::Work { plan, .. } = work(3) else {
             unreachable!()
         };
-        let cmd = ex.issue(0, "r0", work(3), plan.action.clone(), 0.0, 20.0, 100.0, 0.0);
+        let cmd = ex.issue(0, "r0", work(3), plan.action.clone(), sent(20.0));
         assert_eq!(cmd.command_id, "os-000001");
         assert!(ex.busy().cell(GridCoord { x: 3, y: 0 }));
         assert!(
@@ -447,6 +607,7 @@ mod tests {
             .is_none()
         );
         assert!(ex.active(0).unwrap().accepted);
+        assert_eq!(ex.active(0).unwrap().accepted_est_s, Some(20.0));
         let (a, out) = ex
             .on_event(&ev(EventKind::CommandCompleted {
                 command_id: cmd.command_id,
@@ -471,7 +632,7 @@ mod tests {
         let Job::Work { plan, .. } = work(1) else {
             unreachable!()
         };
-        let cmd = ex.issue(2, "r2", work(1), plan.action, 0.0, 20.0, 100.0, 0.0);
+        let cmd = ex.issue(2, "r2", work(1), plan.action, sent(20.0));
         let (_, out) = ex
             .on_event(&ev(EventKind::CommandRejected {
                 command_id: cmd.command_id,
@@ -521,10 +682,7 @@ mod tests {
                 rescue_for: None,
             },
             Action::MoveTo { target: to },
-            0.0,
-            30.0,
-            100.0,
-            0.0,
+            sent(30.0),
         );
         assert!(ex.active(0).unwrap().interruptible());
         let (cancel, old) = ex.cancel(0, "r0").unwrap();
@@ -554,5 +712,52 @@ mod tests {
             assert!(ex.on_event(&ev(kind)).is_none());
         }
         assert_eq!(ex.stats.cancelled, 1);
+    }
+
+    #[test]
+    fn recovery_jobs_engage_their_targets() {
+        let mut ex = Executor::new();
+        ex.issue(
+            0,
+            "r0",
+            Job::Repair {
+                target: 3,
+                preventive: false,
+            },
+            Action::Repair {
+                target_robot: "r3".into(),
+            },
+            sent(2000.0),
+        );
+        let depot = GridCoord { x: 1, y: 1 };
+        ex.issue(
+            1,
+            "r1",
+            Job::Tow {
+                target: 2,
+                to: depot,
+                purpose: TowPurpose::Depot(0),
+            },
+            Action::Tow {
+                target_robot: "r2".into(),
+                to: depot,
+            },
+            sent(600.0),
+        );
+        ex.issue(
+            4,
+            "r4",
+            Job::Service {
+                depot: 0,
+                preventive: true,
+            },
+            Action::Service { depot: "dp".into() },
+            sent(7200.0),
+        );
+        assert_eq!(ex.engaged(), BTreeSet::from([2, 3]));
+        assert_eq!(ex.engaging(3).map(|a| a.robot), Some(0));
+        assert!(ex.engaging(4).is_none());
+        assert!(!ex.active(0).unwrap().interruptible());
+        assert!(ex.active(1).unwrap().job.label().contains("tow robot #2"));
     }
 }
