@@ -4,7 +4,7 @@ All notable changes to ArcadiaOS. Versions follow semver.
 
 ## [Unreleased]
 
-Version 1.1.0, in development. It speaks arcadia-protocol 1.1.0, which does not work with protocol 1.0: it needs ArcadiaBench 1.1 or later. Support for ArcadiaBench 1.1's harder default catalog is being built.
+Version 1.1.0, in development. It speaks arcadia-protocol 1.1.0, which does not work with protocol 1.0: it needs ArcadiaBench 1.1 or later. It builds on both of ArcadiaBench's catalogs: 1.0, and the default 1.1, where a build takes weeks. On catalog 1.1, seeds 1–50, it finishes all 900 runs with no policy violation and no robot lost, 9 to 15% ahead of the greedy baseline in every scenario; these are development measurements until ArcadiaBench publishes its 1.1 results.
 
 ### Added
 
@@ -30,7 +30,8 @@ Version 1.1.0, in development. It speaks arcadia-protocol 1.1.0, which does not 
   - **Pass windows.** The Earth link's new cause `between_passes` and the end of the window in progress (`window_end_t`) are taken in. Nothing acts on them yet.
   - **Later minor versions.** Values this version does not know (a status, a surface, a reject reason, a fault severity, an uplink, an objective) are handled safely instead of being impossible: an unknown status is not commanded, an unknown surface is treated as unworked ground, and an unknown message is ignored.
 - **Cold nights.** When heaters will run is still forecast as a window of the sol, but a temperature seen on the wrong side of the simulator's threshold now moves the window. On ArcadiaBench the assumed window already holds, so nothing changes there.
-- **Integration tests.** They name ArcadiaBench's catalog 1.0, and CI runs them against ArcadiaBench's `main` at the commit that added catalogs and the fleet design track.
+- **Integration tests.** The existing ones name ArcadiaBench's catalog 1.0, a new one builds on each outpost of catalog 1.1, and CI runs them against ArcadiaBench's `main` at the commit that added catalogs and the fleet design track.
+- **The test simulator's world is a parameter.** `tests/support/minisim.rs` can be a world like catalog 1.1 (settlement, errors on graded, settled and scanned heights, constants in `hello`), and a crew test builds in it.
 
 ## [1.0.0] - 2026-11-04
 
