@@ -965,10 +965,10 @@ impl State {
         self.report(&mut round, cfg, diag);
 
         let mut wake = next_cooldown.filter(|&w| w > now);
-        let waiting =
-            !round.free.is_empty() || (0..n).any(|r| self.world.fleet.get(r).recoverable());
+        let recoverable = (0..n).any(|r| self.world.fleet.get(r).recoverable());
+        let waiting = !round.free.is_empty() || recoverable;
         if (self.exec.idle() || waiting) && !progress.complete() {
-            let idle_wake = now + cfg.idle_wake_s;
+            let idle_wake = now + self.idle_wait_s(&round.free, recoverable, cfg);
             wake = Some(wake.map_or(idle_wake, |w| w.min(idle_wake)));
         }
         // Look again when Earth's answer is due, or at once after asking
@@ -2620,6 +2620,31 @@ impl State {
             );
             round.free.retain(|&x| x != r);
         }
+    }
+
+    /// How long idle robots can be left unlooked at, s. Whatever happens to
+    /// the crew arrives as an event and wakes ArcadiaOS by itself; the one
+    /// thing that does not is an idle robot's battery running down. So the
+    /// wait is until the first free robot would be half-way to needing to
+    /// park and charge, at its idle draw with the heater on, within
+    /// `idle_wake_s` and `idle_wake_max_s`. With nothing in flight at all,
+    /// or a robot waiting to be recovered, no event may be coming and the
+    /// short wake-up stands.
+    fn idle_wait_s(&self, free: &[usize], recoverable: bool, cfg: &Config) -> f64 {
+        if recoverable || self.exec.idle() {
+            return cfg.idle_wake_s;
+        }
+        let mut wait = cfg.idle_wake_max_s.max(cfg.idle_wake_s);
+        for &r in free {
+            let e = self.world.fleet.get(r);
+            let Some(pos) = e.position() else { continue };
+            let spare_wh = (e.battery_wh() - self.park_need_wh(r, pos, cfg)).max(0.0);
+            let draw_w = self.reg.idle_wh(r, 3600.0) * (1.0 + cfg.heater_idle_factor.max(0.0));
+            if draw_w > 0.0 {
+                wait = wait.min(0.5 * spare_wh / draw_w * 3600.0);
+            }
+        }
+        wait.max(cfg.idle_wake_s)
     }
 
     /// Battery robot `r` at `at` needs to sit idle for the parking horizon

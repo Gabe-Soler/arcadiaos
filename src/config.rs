@@ -109,8 +109,14 @@ pub struct Config {
     pub retry_backoff_s: f64,
     /// Decisions at one sim time before ArcadiaOS stops issuing and waits.
     pub max_same_time_decisions: u32,
-    /// Wake-up interval while waiting with nothing in flight, s.
+    /// Wake-up interval while waiting with nothing in flight, or with a
+    /// robot waiting to be recovered, s. It is also the shortest wait when
+    /// robots are merely idle.
     pub idle_wake_s: f64,
+    /// The longest ArcadiaOS leaves idle robots unlooked at while others
+    /// work, s. Until then it wakes when the first of them would need to
+    /// park and charge, or when something happens.
+    pub idle_wake_max_s: f64,
     /// Remaining unfinished pad cells at which the end game starts.
     pub endgame_cells: usize,
 
@@ -358,6 +364,7 @@ impl Default for Config {
             retry_backoff_s: 300.0,
             max_same_time_decisions: 50,
             idle_wake_s: 900.0,
+            idle_wake_max_s: 7200.0,
             endgame_cells: 8,
 
             tow_speed_factor: 0.5,
