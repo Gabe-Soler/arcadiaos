@@ -15,9 +15,57 @@ use std::collections::{BTreeSet, VecDeque};
 use std::f64::consts::PI;
 
 const GRADE_WINDOW: f64 = 0.15;
-const COMPACT_SETTLE: f64 = 0.01;
-const MIN_WORK_S: f64 = 5.0;
 const ROCK_DENSITY: f64 = 2800.0;
+
+/// How the simulated world works. [`Physics::exact`] is what the simulator
+/// has always done: protocol 1.0's reference constants, no noise, and a
+/// `hello` without constants. [`Physics::weeks`] is a world like
+/// ArcadiaBench's catalog 1.1.
+#[derive(Clone, Copy)]
+pub struct Physics {
+    /// How far compaction lowers a cell, m.
+    pub settle_m: f64,
+    /// Floor on a per-cell work step, s.
+    pub min_work_s: f64,
+    /// Half-width of the uniform error on a graded height, m.
+    pub grade_noise_m: f64,
+    /// Half-width of the uniform error on a settlement, m.
+    pub settle_noise_m: f64,
+    /// Half-width of the uniform error on a scanned height, m.
+    pub scan_noise_m: f64,
+    /// Whether `hello` carries `scenario.constants`, as a protocol 1.1
+    /// simulator's does.
+    pub send_constants: bool,
+}
+
+impl Physics {
+    pub fn exact() -> Self {
+        Self {
+            settle_m: 0.01,
+            min_work_s: 5.0,
+            grade_noise_m: 0.0,
+            settle_noise_m: 0.0,
+            scan_noise_m: 0.0,
+            send_constants: false,
+        }
+    }
+
+    /// Compaction takes 4 cm off a cell, heights are graded, settled and
+    /// scanned with errors of standard deviation 6, 5 and 10 mm (a uniform
+    /// error of half-width `h` has standard deviation `h / sqrt(3)`), and
+    /// the simulator says so in `hello`.
+    pub fn weeks() -> Self {
+        let half = |sd: f64| sd * 3f64.sqrt();
+        Self {
+            settle_m: 0.04,
+            min_work_s: 30.0,
+            grade_noise_m: half(0.006),
+            settle_noise_m: half(0.005),
+            scan_noise_m: half(0.01),
+            send_constants: true,
+        }
+    }
+}
 
 /// A deterministic xorshift generator for terrain.
 pub struct Rand(u64);
@@ -139,6 +187,9 @@ pub struct MiniSim {
     decision_due: bool,
     pub stats: Stats,
     hello: Hello,
+    phys: Physics,
+    /// Errors on graded, settled and scanned heights, from their own stream.
+    noise: Rand,
 }
 
 /// A synthetic scenario.
@@ -170,6 +221,12 @@ fn in_rect(r: &GridRect, c: GridCoord) -> bool {
 
 impl MiniSim {
     pub fn new(s: Setup) -> Self {
+        Self::with_physics(s, Physics::exact())
+    }
+
+    /// A simulator of the world `phys` describes.
+    pub fn with_physics(s: Setup, phys: Physics) -> Self {
+        let noise = Rand::new(s.seed ^ 0x5EED_0FAC_0FFE);
         let mut rng = Rand::new(s.seed);
         let (k1, k2) = (rng.range(0.15, 0.35), rng.range(0.15, 0.35));
         let (p1, p2) = (rng.range(0.0, 6.0), rng.range(0.0, 6.0));
@@ -265,7 +322,28 @@ impl MiniSim {
                     range_m: 1000.0,
                 },
                 policy,
-                constants: None,
+                constants: phys.send_constants.then(|| Constants {
+                    grade_window_m: GRADE_WINDOW,
+                    compaction_settlement_m: phys.settle_m,
+                    min_work_duration_s: phys.min_work_s,
+                    rock_density_kg_m3: ROCK_DENSITY,
+                    repair_work_degraded: 0.25,
+                    repair_work_disabled: 1.0,
+                    repair_work_stuck: 0.5,
+                    repair_work_per_wear_removed: 0.3,
+                    repair_wear_removed_fraction: 0.5,
+                    strip_work: 0.5,
+                    install_work: 1.0,
+                    tow_speed_factor: 0.5,
+                    tow_energy_factor: 2.0,
+                    depot_service_s: 7200.0,
+                    depot_capacity: 1,
+                    heater_threshold_c: -60.0,
+                    heater_power_factor: 1.0,
+                    relay_radio_w: 25.0,
+                    lost_link_timeout_s: 1800.0,
+                    earth_response_mean_s: 1200.0,
+                }),
             },
         };
         let bots: Vec<Bot> = s
@@ -321,6 +399,8 @@ impl MiniSim {
             decision_due: true,
             stats: Stats::default(),
             hello,
+            phys,
+            noise,
         };
         sim.emit(EventKind::EarthMessage {
             sent_t: 0.0,
@@ -671,10 +751,19 @@ impl MiniSim {
         self.next_step(r);
     }
 
+    /// A uniform error of half-width `half`, m; none in an exact world.
+    fn error(&mut self, half: f64) -> f64 {
+        if half > 0.0 {
+            self.noise.range(-half, half)
+        } else {
+            0.0
+        }
+    }
+
     fn work(&self, r: usize, cap: CapabilityName, units: f64) -> (f64, f64) {
         let b = &self.bots[r];
         let c = b.cap(cap).expect("validated capability");
-        let d = (units / c.rate).max(MIN_WORK_S);
+        let d = (units / c.rate).max(self.phys.min_work_s);
         (
             d,
             units * c.energy_wh_per_unit + d * b.spec.idle_power_w / 3600.0,
@@ -932,13 +1021,13 @@ impl MiniSim {
             }
             Step::Grade(c, target) => {
                 let i = self.idx(c);
-                self.cells[i].elev = target;
+                self.cells[i].elev = target + self.error(self.phys.grade_noise_m);
                 self.cells[i].surface = Surface::Graded;
                 self.changed(c);
             }
             Step::Compact(c) => {
                 let i = self.idx(c);
-                self.cells[i].elev -= COMPACT_SETTLE;
+                self.cells[i].elev -= self.phys.settle_m + self.error(self.phys.settle_noise_m);
                 self.cells[i].surface = Surface::Compacted;
                 self.changed(c);
             }
@@ -948,13 +1037,16 @@ impl MiniSim {
                 self.changed(c);
             }
             Step::Scan(area) => {
+                let half = self.phys.scan_noise_m;
+                let errors: Vec<f64> = rect_cells(&area).map(|_| self.error(half)).collect();
                 let cells: Vec<CellObservation> = rect_cells(&area)
-                    .map(|c| {
+                    .zip(errors)
+                    .map(|(c, error)| {
                         let t = &self.cells[self.idx(c)];
                         CellObservation {
                             at: c,
                             cell: Cell {
-                                elevation_m: Some(t.elev),
+                                elevation_m: Some(t.elev + error),
                                 regolith: Some(Regolith {
                                     depth_m: Some(t.depth),
                                     bulk_density_kg_m3: Some(t.density),
