@@ -387,6 +387,14 @@ impl Registry {
     }
 
     /// Station charging power for one slot, best over all stations, W.
+    /// Power of all station slots together, W.
+    pub fn total_slot_power_w(&self) -> f64 {
+        self.stations
+            .iter()
+            .map(|s| f64::from(s.slots) * s.slot_power_w.max(0.0))
+            .sum()
+    }
+
     pub fn best_slot_power_w(&self) -> f64 {
         self.stations
             .iter()

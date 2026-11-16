@@ -941,9 +941,12 @@ impl State {
             && self.replan_allowed(&available, cfg, diag)
         {
             self.capacity = CapacityPlan::solve(&workload, &self.reg, &available, cfg);
+            self.capacity.bound_by_power(self.deliverable_w());
             self.capacity_dirty = false;
             diag.info(now, || describe_capacity(&self.capacity, &self.reg));
         }
+        // The dust moves between solves, and with it what the plant delivers.
+        self.capacity.bound_by_power(self.deliverable_w());
         self.release_chargers(cfg);
 
         let mut round = self.round(workload, now);
@@ -1428,6 +1431,10 @@ impl State {
     fn recover(&mut self, round: &mut Round, cfg: &Config, diag: &Diag) {
         let now = round.now;
         let n = self.reg.len();
+        // A robot that came back another way needs no parts: the strip asked
+        // for it is forgotten, and its donor is a robot to recover again.
+        let fleet = &self.world.fleet;
+        self.strips.retain(|&(_, t)| fleet.get(t).recoverable());
         let mut targets: Vec<(bool, usize)> = (0..n)
             .filter(|&r| self.world.fleet.get(r).recoverable())
             .filter(|&r| self.in_contact(r))
@@ -1460,12 +1467,13 @@ impl State {
             let depot_wait = |d: usize, t: f64| round.depot_wait(d, capacity, t);
             let blocked = &round.blocked;
             let may = |action: &str| !blocked.contains(action);
-            let (authority, reg) = (&self.authority, &self.reg);
+            let (authority, reg, strips) = (&self.authority, &self.reg, &self.strips);
             let may_strip = |d: usize| {
                 strip_level <= 2
-                    || authority
-                        .authorization("cannibalize", &strip_purpose(reg, d, x), now)
-                        .is_some()
+                    || (strips.contains(&(d, x))
+                        && authority
+                            .authorization("cannibalize", &strip_purpose(reg, d, x), now)
+                            .is_some())
             };
             let (plan, ask) = {
                 let ctx = recovery::Ctx {
@@ -1487,12 +1495,44 @@ impl State {
                     .then(|| recovery::best_cannibalize(&ctx, x, &helpers))
                     .flatten()
                     .filter(|c| plan.as_ref().is_none_or(|p| c.cost_s < p.cost_s));
+                // Parts are weighed against the slow way back, which may
+                // need hands that are busy at this moment: what the crew
+                // could do for `x`, and for the donor if it is down itself,
+                // with every working robot free to help.
+                let ask = ask.map(|c| {
+                    let nobody = BTreeSet::new();
+                    let later = recovery::Ctx {
+                        engaged: &nobody,
+                        running: &nobody,
+                        ..ctx
+                    };
+                    let hands = |not: usize| -> Vec<usize> {
+                        (0..n)
+                            .filter(|&h| h != not && self.world.fleet.get(h).operable())
+                            .collect()
+                    };
+                    let slow = plan
+                        .clone()
+                        .or_else(|| recovery::plan(&later, x, &hands(x)));
+                    let donor_returns = match c.step {
+                        recovery::Step::Cannibalize { donor, .. } => {
+                            self.world.fleet.get(donor).operable()
+                                || recovery::plan(&later, donor, &hands(donor)).is_some()
+                        }
+                        _ => false,
+                    };
+                    Parts {
+                        strip: c,
+                        slow,
+                        donor_returns,
+                    }
+                });
                 (plan, ask)
             };
             // Parts from a donor would beat everything allowed: ask Earth, or
             // wait for its answer, unless the level-3 rule says not to bother.
-            if let Some(c) = ask
-                && self.weigh_cannibalize(x, plan.as_ref(), &c, cfg, diag)
+            if let Some(parts) = ask
+                && self.weigh_cannibalize(x, &parts, &round.workload, cfg, diag)
             {
                 continue;
             }
@@ -1521,11 +1561,12 @@ impl State {
     fn weigh_cannibalize(
         &mut self,
         x: usize,
-        alt: Option<&recovery::Plan>,
-        c: &recovery::Plan,
+        parts: &Parts,
+        workload: &Workload,
         cfg: &Config,
         diag: &Diag,
     ) -> bool {
+        let (c, alt, donor_returns) = (&parts.strip, parts.slow.as_ref(), parts.donor_returns);
         let now = self.world.now;
         let recovery::Step::Cannibalize { donor, .. } = c.step else {
             return false;
@@ -1538,26 +1579,59 @@ impl State {
         if self.strip_live(|_, t| t == donor) {
             return false;
         }
-        // Answered, or lapsed: what is allowed now stands.
-        if self.authority.asked("cannibalize", &purpose) {
-            return false;
-        }
-        let weight = self.capacity.utilization(x).clamp(0.2, 1.0);
-        // A robot is worth the work it would still do: its share of what
-        // is left of the build. With nothing else to bring `x` back, that
-        // is what cannibalizing gains; and it is what stripping the donor
-        // risks, if Earth would rather have kept it.
-        let left_s = self.capacity.makespan_s.max(0.0);
-        let alt_s = alt.map_or(cfg.no_alternative_s.max(left_s), |p| p.cost_s);
-        let donor_worth_s = self.capacity.utilization(donor) * left_s;
+        // A robot is worth the time the build would lose without it. The
+        // rest of the build is planned four ways: with the crew as it is
+        // (`x` down), with `x` back as well, with `x` in the donor's place,
+        // and with both gone. A donor that is down but has its own way
+        // back counts as a robot the crew has.
+        let n = self.reg.len();
+        let crew = |back: Option<usize>, gone: Option<usize>| -> Vec<bool> {
+            (0..n)
+                .map(|r| {
+                    Some(r) != gone
+                        && (Some(r) == back
+                            || (r == donor && donor_returns)
+                            || (r != x && self.world.fleet.get(r).operable()))
+                })
+                .collect()
+        };
+        let without_s = self.build_time_s(workload, &crew(None, None), cfg);
+        let both_s = self.build_time_s(workload, &crew(Some(x), None), cfg);
+        let swapped_s = self.build_time_s(workload, &crew(Some(x), Some(donor)), cfg);
+        let stripped_s = self.build_time_s(workload, &crew(None, Some(donor)), cfg);
+        // What a second without `x` costs the build.
+        let rate = if without_s > 0.0 {
+            ((without_s - both_s) / without_s).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // Without the parts: `x` comes back the slow way, or not at all.
+        let otherwise_s = alt.map_or(without_s, |p| both_s + p.cost_s * rate);
+        let alt_s = alt.map_or(without_s, |p| p.cost_s);
         let stakes = Stakes {
-            benefit_s: (alt_s - c.cost_s).max(0.0) * weight,
-            wait_cost_per_s: weight,
-            risk_s: cfg.cannibalize_risk_s.max(donor_worth_s),
+            benefit_s: (otherwise_s - (swapped_s + c.cost_s * rate)).max(0.0),
+            wait_cost_per_s: rate,
+            // The donor, if the parts were not worth it after all.
+            risk_s: cfg.cannibalize_risk_s.max(stripped_s - without_s),
         };
         let max_wait = self.world.policy.level3.max_wait_s;
         let reach = self.reach(cfg);
-        let ask = match authority::level3_rule(&stakes, reach, now, max_wait, cfg.answer_margin) {
+        let rule = authority::level3_rule(&stakes, reach, now, max_wait, cfg.answer_margin);
+        // Earth is not asked the same thing twice. What it allowed stands,
+        // and is used again only if the parts are worth it now.
+        if self.authority.asked("cannibalize", &purpose) {
+            if rule.is_some()
+                && !self.strips.contains(&(donor, x))
+                && self
+                    .authority
+                    .authorization("cannibalize", &purpose, now)
+                    .is_some()
+            {
+                self.strips.push((donor, x));
+            }
+            return false;
+        }
+        let ask = match rule {
             Some(a) if authority::level(&self.world.policy, "cannibalize") == 3 => a,
             // Level 4: only worth asking if an answer can come, and never on a fallback.
             Some(a) if a.decide_by_t > now => authority::Ask {
@@ -2645,6 +2719,41 @@ impl State {
         }
     }
 
+    /// How long the rest of the build would take the robots in `crew`, s:
+    /// the capacity plan's makespan for them, held to what the site
+    /// delivers. A crew that has lost every robot for some of the work
+    /// never finishes, which costs all the time the run has left.
+    fn build_time_s(&self, workload: &Workload, crew: &[bool], cfg: &Config) -> f64 {
+        let left_s = if self.world.time_limit_t > self.world.now {
+            self.world.time_limit_t - self.world.now
+        } else {
+            cfg.no_alternative_s.max(self.capacity.makespan_s)
+        };
+        // Work that no robot of this crew was ever built for is nobody's to
+        // lose; work whose every robot is out of `crew` is.
+        let undoable = workload.iter().any(|(&cap, w)| {
+            let built_for = self.reg.capable(cap);
+            w.steps > 0.0
+                && !built_for.is_empty()
+                && !built_for
+                    .iter()
+                    .any(|&r| crew.get(r).copied().unwrap_or(false))
+        });
+        if undoable {
+            return left_s;
+        }
+        let mut plan = CapacityPlan::solve(workload, &self.reg, crew, cfg);
+        plan.bound_by_power(self.deliverable_w());
+        plan.makespan_s.min(left_s)
+    }
+
+    /// The power the site can put into the crew over a sol, W: what its
+    /// station slots carry, or what the plant has to spare, whichever is
+    /// less.
+    fn deliverable_w(&self) -> f64 {
+        self.reg.total_slot_power_w().min(self.power.mean_spare_w())
+    }
+
     /// How often Earth gets a status report while the link is up, s: the
     /// configured period, which is a sol on Mars, kept to the scenario's
     /// own sol where that differs.
@@ -2825,6 +2934,18 @@ impl State {
     }
 }
 
+/// Parts from a donor for a robot that is down, and what they are weighed
+/// against.
+struct Parts {
+    /// The strip: who takes the parts off which donor, and how long until
+    /// the robot is back.
+    strip: recovery::Plan,
+    /// The slow way back without parts, once the crew's hands are free.
+    slow: Option<recovery::Plan>,
+    /// Whether the donor works, or has its own way back.
+    donor_returns: bool,
+}
+
 /// Approval purpose for stripping `donor` to restore `target`.
 fn strip_purpose(reg: &Registry, donor: usize, target: usize) -> String {
     format!("strip {} for {}", reg.robot(donor).id, reg.robot(target).id)
@@ -2952,9 +3073,14 @@ fn describe_capacity(plan: &CapacityPlan, reg: &Registry) -> String {
         }
     }
     format!(
-        "capacity plan{}: makespan {:.1} h; {}",
+        "capacity plan{}: makespan {:.1} h{}; {}",
         if plan.optimal { "" } else { " (fallback)" },
         plan.makespan_s / 3600.0,
+        if plan.power_s >= plan.makespan_s && plan.power_s > 0.0 {
+            ", set by the power the site delivers"
+        } else {
+            ""
+        },
         parts.join("; ")
     )
 }
@@ -2962,6 +3088,7 @@ fn describe_capacity(plan: &CapacityPlan, reg: &Registry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::CapWork;
     use crate::diag::Level;
     use crate::registry::tests::{cap, robot, scenario};
     use arcadia_protocol::*;
@@ -3731,13 +3858,19 @@ mod tests {
     /// A sinterer and a spare one, both failed beyond field repair, a third
     /// sinterer working, and a scout that can strip and fit parts. Nothing
     /// can tow and there is no depot, so parts from the spare are the only
-    /// way to bring the sinterer back.
+    /// way to bring the sinterer back. The pad is half a sol of sintering
+    /// for one robot, so a second one is worth hours.
     fn strip_os(cannibalize: u8, cfg: Config) -> (Coordinator, Vec<RobotState>) {
+        strip_os_at(cannibalize, cfg, 0.0002)
+    }
+
+    /// [`strip_os`] with sinterers that work at `rate` m2/s.
+    fn strip_os_at(cannibalize: u8, cfg: Config, rate: f64) -> (Coordinator, Vec<RobotState>) {
         let sinterer = |id: &str| {
             robot(
                 id,
                 0.15,
-                vec![cap(CapabilityName::Sinter, 0.01, 60.0, None)],
+                vec![cap(CapabilityName::Sinter, rate, 60.0, None)],
             )
         };
         let mut sc = scenario(vec![
@@ -3884,6 +4017,102 @@ mod tests {
             robots,
         });
         assert!(strip_command(&d).is_none());
+    }
+
+    #[test]
+    fn a_robot_is_worth_the_time_the_build_would_lose_without_it() {
+        // The same crew with a pad that one sinterer finishes in a quarter
+        // of an hour: fitting parts would take longer than the work that is
+        // left, so the spare is left whole and Earth is not asked.
+        let (mut os, robots) = strip_os_at(3, Config::default(), 0.01);
+        let d = os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal(), comms(Link::Up, CommsCause::Nominal)],
+            robots,
+        });
+        assert!(approval_request(&d).is_none());
+        // The figures behind it, on the pad that takes half a sol.
+        let (mut os, robots) = strip_os(3, Config::default());
+        os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal(), comms(Link::Up, CommsCause::Nominal)],
+            robots,
+        });
+        let cfg = os.cfg.clone();
+        let st = os.state.as_ref().unwrap();
+        let mut work = Workload::new();
+        work.insert(
+            CapabilityName::Sinter,
+            CapWork {
+                units: 9.0,
+                steps: 9.0,
+                travel_m_per_step: 1.0,
+                passes: 1.0,
+            },
+        );
+        // Robots: the failed sinterer, the scout, the failed spare, the
+        // working sinterer.
+        let one = st.build_time_s(&work, &[false, true, false, true], &cfg);
+        let two = st.build_time_s(&work, &[true, true, false, true], &cfg);
+        assert!(one > 45_000.0 && one < 50_000.0, "{one}");
+        assert!((two - 0.5 * one).abs() < 1.0, "{two}");
+        // A scout more or less changes nothing for sintering.
+        assert_eq!(
+            st.build_time_s(&work, &[false, false, false, true], &cfg),
+            one
+        );
+        // With no sinterer left the pad is never finished: that costs all
+        // the time the run has.
+        let left = st.world.time_limit_t - st.world.now;
+        assert!(left > one);
+        assert_eq!(
+            st.build_time_s(&work, &[false, true, false, false], &cfg),
+            left
+        );
+        // Work no robot here was built for is nobody's to lose.
+        work.insert(
+            CapabilityName::Dig,
+            CapWork {
+                units: 1.0,
+                steps: 9.0,
+                travel_m_per_step: 1.0,
+                passes: 1.0,
+            },
+        );
+        assert_eq!(
+            st.build_time_s(&work, &[false, true, false, true], &cfg),
+            one
+        );
+    }
+
+    #[test]
+    fn a_donor_is_released_when_the_parts_are_no_longer_needed() {
+        let (mut os, mut robots) = strip_os(3, Config::default());
+        let d = os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal(), comms(Link::Up, CommsCause::Nominal)],
+            robots: robots.clone(),
+        });
+        assert!(approval_request(&d).is_some());
+        // The spare (robot 2) is held as the donor for the worker (robot 0).
+        let st = os.state.as_ref().unwrap();
+        assert_eq!(st.strips, vec![(2, 0)]);
+        assert!(st.strip_live(|d, _| d == 2));
+        // The worker comes back another way before Earth answers: the spare
+        // is a robot to recover again, not one waiting to be stripped.
+        robots[0] = state("worker", 12, 12);
+        os.decide(&Observation {
+            seq: 1,
+            t: 600.0,
+            events: vec![],
+            robots,
+        });
+        let st = os.state.as_ref().unwrap();
+        assert!(st.strips.is_empty());
+        assert!(!st.strip_live(|d, _| d == 2));
     }
 
     #[test]
