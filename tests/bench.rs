@@ -3,11 +3,12 @@
 //!
 //! Set `ARCADIABENCH` to the path of an `arcadiabench` binary to run these;
 //! without it they print a note and pass. The binary must speak this
-//! coordinator's protocol version: ArcadiaBench 1.1 or later. They use
+//! coordinator's protocol version: ArcadiaBench 1.1 or later. Most use
 //! ArcadiaBench's scenario catalog 1.0, named explicitly, with the `nominal`
 //! variant (hybrid power and the nominal fault model) and the `conjunction`
-//! variant (a two-week Earth blackout early in the run). Run them in release
-//! so the coordinator under test is the release build:
+//! variant (a two-week Earth blackout early in the run). One builds a pad on
+//! each outpost of catalog 1.1, where a build takes weeks. Run them in
+//! release so the coordinator under test is the release build:
 //!
 //! ```sh
 //! ARCADIABENCH=/path/to/arcadiabench cargo test --release --test bench
@@ -47,11 +48,26 @@ const CATALOG: &str = "1.0";
 
 /// Run one seed of `variant` and return the simulator's one-line summary.
 fn run(bench: &Path, variant: &str, seed: u64, log: &Path) -> String {
+    run_on(bench, CATALOG, "small", variant, seed, log)
+}
+
+/// Run one seed of a scenario of `catalog` and return the simulator's
+/// one-line summary.
+fn run_on(
+    bench: &Path,
+    catalog: &str,
+    preset: &str,
+    variant: &str,
+    seed: u64,
+    log: &Path,
+) -> String {
     let out = Command::new(bench)
         .args([
             "run",
             "--catalog",
-            CATALOG,
+            catalog,
+            "--preset",
+            preset,
             "--seed",
             &seed.to_string(),
             "--variant",
@@ -149,6 +165,49 @@ fn seeds_one_to_three_complete_the_pad_within_the_policy() {
             );
             let _ = fs::remove_file(&log);
         }
+    }
+}
+
+/// Catalog 1.1: a square metre takes seven hours and 37 kWh to sinter,
+/// compaction takes 4 cm off a cell, heights are scanned with a centimetre
+/// of error, wear and faults build up over weeks, and Earth is reachable in
+/// short passes. One build on each outpost, held to finishing sooner than
+/// the mean of ArcadiaBench's greedy baseline over seeds 1 to 50 (54.7,
+/// 27.7 and 18.1 sols).
+#[test]
+fn a_build_of_weeks_completes_on_every_outpost_of_catalog_1_1() {
+    let Some(bench) = bench() else {
+        return skip("a_build_of_weeks_completes_on_every_outpost_of_catalog_1_1");
+    };
+    for (preset, within_sols) in [("small", 54.0), ("medium", 27.0), ("large", 18.0)] {
+        let log = log_path(&format!("weeks-{preset}"));
+        let summary = run_on(&bench, "1.1", preset, "nominal", 1, &log);
+        assert!(summary.contains("GoalsComplete"), "{preset}: {summary}");
+        let (reason, m, rejections) = logged_end(&log);
+        assert_eq!(reason, EndReason::GoalsComplete, "{preset}");
+        assert!(m.completed, "{preset}");
+        assert!(
+            m.sols < within_sols,
+            "{preset}: {:.1} sols, the greedy baseline's mean is {within_sols}",
+            m.sols
+        );
+        assert_eq!(m.fleet.robots_lost, 0, "{preset}: no robot is given up");
+        assert_eq!(m.autonomy.policy_violations, 0, "{preset}");
+        assert!(
+            !rejections.iter().any(|r| matches!(
+                r,
+                RejectReason::ApprovalRequired | RejectReason::OutOfCoverage
+            )),
+            "{preset}: {rejections:?}"
+        );
+        // Decisions follow events: a few thousand over weeks, not one every
+        // quarter of an hour.
+        assert!(m.decisions < 5000, "{preset}: {} decisions", m.decisions);
+        eprintln!(
+            "catalog 1.1 {preset}: {:.1} sols, {} decisions, {} faults, {} requests to Earth",
+            m.sols, m.decisions, m.fleet.faults, m.autonomy.approval_requests
+        );
+        let _ = fs::remove_file(&log);
     }
 }
 
