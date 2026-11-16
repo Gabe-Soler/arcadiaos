@@ -33,6 +33,7 @@ ArcadiaOS speaks arcadia-protocol 1.1.0. The protocol's [semantics](https://gith
 | Module | Responsibility |
 |---|---|
 | `world` | World model: per-cell site knowledge (`world::site`), the crew (`world::fleet`), stations, depots, the base station, power, weather, the Earth link and the policy in force. |
+| `design` | Crew design: which crew to send for a scenario and a mass budget (`arcadiaos design-crew`). It runs no session. |
 | `registry` | Capability registry: who can do what, at what rate and energy per unit, haul and charger capacities, and the travel and work cost models built on them. |
 | `planner` | Goal → task graph: sections and sweep order, per-cell readiness, berm, verification batching, rework and the recheck loop. `planner::material` keeps the cut/fill ledger: stockpile siting, spoil casting, haul sources and borrow. |
 | `tasks` | Task and stage types shared by the planner, allocator and executor. |
@@ -393,10 +394,12 @@ ArcadiaOS never issues a command that would complete instantly, such as a move t
 - **Coordinator tests:** tow to the depot then service in place, charge in place at a station, a mobile charger for an offline robot, repair of a stuck and failed robot, parking charged before the night, a mobile charger driving to a slow robot, lost robots never commanded, a level-2 tow notified in the same decision, a policy update applied on arrival, cannibalizing asked about and done on approval (and not on a veto), the fallback deciding at once in a blackout (and nothing done at level 4), robots out of contact never commanded, and a relay stationed for work beyond coverage.
 - **`tests/crews.rs`:** synthetic scenarios on a small deterministic simulator written from the interface semantics. It covers crews of 3, 4, 5, 10 and 20 robots, generalists, mixed and overlapping capability sets, several stations, fifth-size batteries and a crew with no hauler. A mobile charger beats a weak, distant station, and a robot stranded too far from any charger is rescued by one. It also checks determinism and the per-decision time. The simulator's world is a parameter: one crew builds in a world like catalog 1.1 (4 cm of settlement, errors on graded, settled and scanned heights, sinterers that take seven hours and 37 kWh a cell, constants in `hello`) and has to sinter no cell twice.
 - **`tests/robustness.rs`:** hostile rejections, malformed but valid goals, unknown robots and commands, no stations and immobile robots.
+- **Crew design:** unit tests of the designs read from a scenario, the limits, the plant's limit on sinterers, the value of a spare, the scenario file and the arguments.
 - **`tests/session.rs`:** the real binary over stdio. It covers the handshake, version errors, planning once the goal arrives, back-off after a rejection, and silence by default.
 - **`tests/bench.rs`:** the real binary under ArcadiaBench, when `ARCADIABENCH` is set.
   - Catalog 1.0, `nominal` and `conjunction` variants: seeds 1–3 of each must finish `goals_complete` with no robot lost, no policy violation, no `approval_required` or `out_of_coverage` rejection and at least one status report (metrics are read from `run_end`), and the same seed twice must give byte-identical logs.
   - Catalog 1.1: one build on each of Small, Medium and Large must finish sooner than the greedy baseline's mean, with no robot lost, no policy violation and fewer than 5,000 decisions.
+  - The fleet design track: `arcadiaos design-crew` designs a crew from `arcadiabench scenario --goal`, `arcadiabench crew` accepts it and refuses it with two more sinterers, and ArcadiaOS builds the pad with it in under 20 sols.
 
 ## Results
 
@@ -434,6 +437,34 @@ ArcadiaBench 1.1's default catalog makes the build take weeks: seven hours and 3
 - ArcadiaOS finished all 900 runs with no policy violation and no robot lost, and has the higher headline in all 18 scenarios, by 9 to 15%. Greedy finished 899.
 - It takes about 3,500 decisions a run, against greedy's 3,000.
 - **Where the time goes.** Sintering 400 cells takes 14.8 MWh, 96% of all the energy the robots use. On Small and Medium the sinterers set the pace. On Large, and with solar power only, the plant does: the crew draws all it generates, so the remaining differences between coordinators there are in the energy spent on anything other than sintering.
+
+## Crew design
+
+[`design`](../src/design.rs) answers a question that comes before a build: with a launch mass to spend, how many robots of each design should go? `arcadiaos design-crew` reads a scenario (the `hello` and the goal, as `arcadiabench scenario --goal` prints them) and a mass budget, and prints a crew file. It runs no session.
+
+**The model** is the one ArcadiaOS builds by. For every crew within the limits (a number of robots and a mass; under a second in all for four designs and 4 to 20 robots):
+
+1. **Plan the pad** from the site as seen from orbit, and split the work with the [capacity plan](#capacity-plan-linear-program). A crew that lacks a capability the pad needs is not a candidate.
+2. **Hold it to the plant.** The build takes at least as long as the site needs to deliver its energy. Where the crew sets the pace instead, its time is raised by `design_crew_overhead`, 3%: what ArcadiaOS's own builds on catalog 1.1 take over their plans for repairs, faults, rechecks and waits for a charger (49.1 sols against 47.7 planned with three sinterers, 24.6 against 23.9 with six).
+3. **Charge for outages.** Each robot is taken to be out for `design_outage_frac`, 1%, of the build, and its absence costs the build time of the crew without it, at most twice the crew's own. A crew whose only scout is out stands still; one with a second scout does not. This is worked out for the 200 quickest crews.
+4. **Choose.** Among the crews within 0.5% of the least expected time, the lightest.
+
+**Support roles.** The pad's work is not all a crew is for: a robot that fails has to be repaired, and one that runs flat in the field has to be charged where it stands. A crew keeps a robot for each of those when the designs offer one. Without this rule the model's favourite on ArcadiaBench had no hauler. It was the quickest crew when it finished, and it finished 27 runs of 60. In the run looked at, its only excavator ran flat after towing a sinterer to the depot, nothing could charge it where it stood, and it stayed offline for the other 99 sols.
+
+**On ArcadiaBench's catalog 1.1** (budget 10 t; masses 90, 420, 300 and 900 kg) the plant feeds nine to ten compactor-sinterers, so the designer sends ten and spends what is left on two scouts, an excavator and a hauler. Measured over all six variants, seeds 1–10:
+
+| Crew (scout, excavator, hauler, compactor-sinterer) | Mass | Nominal build | Mean headline | Runs finished |
+|---|---|---|---|---|
+| **2, 1, 1, 10: designed** (expected 16.2 sols) | 9.90 t | 16.1 sols | **0.603** | 60 of 60 |
+| 2, 2, 2, 9 | 9.72 t | 16.6 | 0.579 | 60 |
+| 2, 4, 3, 8: the Large preset's shape, cut to fit | 9.96 t | 18.4 | 0.526 | 60 |
+| 2, 2, 2, 6: the Medium preset's crew | 7.02 t | 24.5 | 0.409 | 60 |
+| 1, 1, 1, 3: the Small preset's crew | 3.51 t | 48.7 | 0.207 | 60 |
+| 2, 1, 0, 10: no hauler | 9.60 t | 16.0 when it finishes | 0.271 | 27 |
+
+The headline here is against the track's one reference for every crew, so a crew with few sinterers scores low. The designer's neighbours with one or three scouts score the same within 0.001.
+
+**What it does not know.** It designs for the one scenario it is given, so a crew for the nominal plant is not the best for `nuclear_heavy`, where power is plentiful and an eleventh sinterer would pay. And the last row shows a limit of ArcadiaOS, not only of the crew: with no mobile charger in the crew, a robot that ran flat was left where it stood. Recovering it by a tow to a station is work still to do.
 
 ## Extension points
 

@@ -70,6 +70,22 @@ pub struct Config {
     pub measure_z: f64,
     /// Scans of one cell after which its mean is taken as it stands.
     pub measure_max_samples: u32,
+    /// Crew design: the fraction of a build each robot is taken to be out
+    /// for, when a crew is charged for what its robots' absence would cost.
+    pub design_outage_frac: f64,
+    /// Crew design: how much longer a build takes than its plan where the
+    /// crew, not the plant, sets the pace: repairs, faults, rechecks and
+    /// waits for a charger, as a fraction of the planned time. ArcadiaOS's
+    /// own builds on ArcadiaBench's catalog 1.1 take 3% more: 49.1 sols
+    /// against 47.7 planned with three sinterers, 24.6 against 23.9 with
+    /// six.
+    pub design_crew_overhead: f64,
+    /// Crew design: crews whose expected build time is within this fraction
+    /// of the least count as equal, and the lightest of them is chosen.
+    pub design_tie_frac: f64,
+    /// Crew design: how many of the quickest crews are charged for outages
+    /// and compared.
+    pub design_shortlist: usize,
     /// At the end of a build whose pad looks finished and is not, a careful
     /// crew scans a cell up to this many times before it redoes one on
     /// suspicion. A scan of the pad takes minutes; a cell redone takes
@@ -353,6 +369,10 @@ impl Default for Config {
             presinter_margin_m: 0.005,
             measure_z: 2.0,
             measure_max_samples: 16,
+            design_outage_frac: 0.01,
+            design_crew_overhead: 0.03,
+            design_tie_frac: 0.005,
+            design_shortlist: 200,
             recheck_max_samples: 48,
             recheck_z: 3.0,
             measure_ahead_cells: 8,

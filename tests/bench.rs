@@ -7,7 +7,8 @@
 //! ArcadiaBench's scenario catalog 1.0, named explicitly, with the `nominal`
 //! variant (hybrid power and the nominal fault model) and the `conjunction`
 //! variant (a two-week Earth blackout early in the run). One builds a pad on
-//! each outpost of catalog 1.1, where a build takes weeks. Run them in
+//! each outpost of catalog 1.1, where a build takes weeks, and one designs
+//! a crew for the fleet design track and builds with it. Run them in
 //! release so the coordinator under test is the release build:
 //!
 //! ```sh
@@ -209,6 +210,116 @@ fn a_build_of_weeks_completes_on_every_outpost_of_catalog_1_1() {
         );
         let _ = fs::remove_file(&log);
     }
+}
+
+/// The fleet design track: ArcadiaOS designs a crew for catalog 1.1's
+/// outpost from what `arcadiabench scenario` prints, ArcadiaBench accepts
+/// it, and ArcadiaOS builds the pad with it.
+#[test]
+fn a_crew_of_its_own_design_enters_the_fleet_design_track_and_builds() {
+    let Some(bench) = bench() else {
+        return skip("a_crew_of_its_own_design_enters_the_fleet_design_track_and_builds");
+    };
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("fleet-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("create a directory");
+    let text = |out: std::process::Output, what: &str| -> String {
+        assert!(
+            out.status.success(),
+            "{what} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("text")
+    };
+    // What a coordinator is told about the outpost every crew works from,
+    // and the goal: two lines.
+    let scenario = dir.join("scenario.jsonl");
+    let told = Command::new(&bench)
+        .args([
+            "scenario",
+            "--catalog",
+            "1.1",
+            "--preset",
+            "medium",
+            "--seed",
+            "1",
+            "--goal",
+        ])
+        .output()
+        .expect("launch arcadiabench");
+    fs::write(&scenario, text(told, "arcadiabench scenario")).expect("write the scenario");
+    // Catalog 1.1's mass budget is 10 t.
+    let designed = Command::new(env!("CARGO_BIN_EXE_arcadiaos"))
+        .args([
+            "design-crew",
+            "--budget-kg",
+            "10000",
+            "--explain",
+            "--scenario",
+        ])
+        .arg(&scenario)
+        .output()
+        .expect("launch arcadiaos");
+    let why = String::from_utf8_lossy(&designed.stderr).to_string();
+    let crew = text(designed, "arcadiaos design-crew");
+    assert!(why.contains("<- chosen"), "{why}");
+    let count = |design: &str| -> u32 {
+        let rest = crew.split(&format!("\"{design}\": ")).nth(1).expect(design);
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().expect("a count")
+    };
+    let counts = ["scout", "excavator", "hauler", "compactor_sinterer"].map(count);
+    eprintln!("designed crew: {} {why}", crew.trim());
+    // Something to scan and repair, to dig, to charge a robot in the
+    // field, and to sinter with: as many sinterers as the plant can feed.
+    assert!(counts.iter().all(|&n| n >= 1), "{crew}");
+    assert!(counts[3] >= 8, "{crew}");
+    // ArcadiaBench lets it enter, and refuses it with two more sinterers.
+    let crew_file = dir.join("crew.json");
+    fs::write(&crew_file, &crew).expect("write the crew");
+    let checked = Command::new(&bench)
+        .arg("crew")
+        .arg(&crew_file)
+        .output()
+        .expect("launch");
+    let verdict = text(checked, "arcadiabench crew");
+    assert!(
+        verdict.contains("of the 10000 kg catalog 1.1 allows"),
+        "{verdict}"
+    );
+    let heavy_file = dir.join("heavy.json");
+    let heavy = crew.replace(
+        &format!("\"compactor_sinterer\": {}", counts[3]),
+        &format!("\"compactor_sinterer\": {}", counts[3] + 2),
+    );
+    fs::write(&heavy_file, heavy).expect("write the crew");
+    let refused = Command::new(&bench)
+        .arg("crew")
+        .arg(&heavy_file)
+        .output()
+        .expect("launch");
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("mass budget is 10000 kg"));
+    // And it builds the pad, sooner than the Medium preset's crew does on
+    // the same outpost (24.6 sols on average).
+    let log = dir.join("run.jsonl");
+    let ran = Command::new(&bench)
+        .args(["run", "--seed", "1", "--crew"])
+        .arg(&crew_file)
+        .arg("--log")
+        .arg(&log)
+        .arg("--")
+        .arg(env!("CARGO_BIN_EXE_arcadiaos"))
+        .env_remove("ARCADIAOS_LOG")
+        .output()
+        .expect("launch arcadiabench");
+    let summary = text(ran, "arcadiabench run --crew");
+    assert!(summary.contains("GoalsComplete"), "{summary}");
+    let (reason, m, _) = logged_end(&log);
+    assert_eq!(reason, EndReason::GoalsComplete);
+    assert!(m.completed && m.sols < 20.0, "{:.1} sols", m.sols);
+    assert_eq!((m.fleet.robots_lost, m.autonomy.policy_violations), (0, 0));
+    eprintln!("its build: {:.1} sols", m.sols);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

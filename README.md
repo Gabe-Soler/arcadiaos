@@ -54,6 +54,24 @@ Each run prints a one-line summary, and `bench` prints its scorecard. ArcadiaBen
 
 ArcadiaOS writes nothing to stderr by default. Set `ARCADIAOS_LOG=info` for plan summaries, the capacity plan, charging, faults, recoveries and maintenance (with each robot's estimated wear at the end), or `ARCADIAOS_LOG=debug` to see every command as well.
 
+## Design a crew
+
+ArcadiaBench's fleet design track lets a coordinator bring its own crew: a count for each robot design, within a mass budget. `arcadiaos design-crew` chooses one, from the same two lines a session starts with:
+
+```sh
+# What a coordinator is told about the outpost every crew works from, and the goal.
+../arcadiabench/target/release/arcadiabench scenario --preset medium --goal > scenario.jsonl
+
+# A crew within catalog 1.1's budget of 10 t; --explain says why on stderr.
+./target/release/arcadiaos design-crew --scenario scenario.jsonl --budget-kg 10000 --explain > crew.json
+
+# Check it, then run every variant with it.
+../arcadiabench/target/release/arcadiabench crew crew.json
+../arcadiabench/target/release/arcadiabench suite --crew crew.json --seeds 1-10 -- ./target/release/arcadiaos
+```
+
+It plans the pad for every crew within the limits with the model ArcadiaOS builds by: the capacity plan, held to the energy the plant can deliver, then charged for what each robot's absence would cost. On catalog 1.1 it sends 2 scouts, 1 excavator, 1 hauler and 10 compactor-sinterers (9.9 t) and expects 16.2 sols; ArcadiaOS builds with them in 16.1 on the nominal variant. Over all six variants and seeds 1–10 that crew's headline is 0.603, against 0.409 for the Medium preset's crew and 0.526 for the Large preset's cut down to fit. [docs/architecture.md](docs/architecture.md#crew-design) has the model.
+
 ## Results
 
 These are ArcadiaOS 1.0.0's results on ArcadiaBench 1.0 ([`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/arcadiabench/blob/v1.0.0/results/v1.0/RESULTS.md)), every preset and variant over seeds 1–50, ArcadiaOS completes all 900 of its runs, with no policy violation and no robot lost, and has the best headline (success rate × speed) in all 18 scenarios, 10–21% above the greedy baseline's:
@@ -76,7 +94,7 @@ ArcadiaBench's [demo replays](https://github.com/Gabe-Soler/arcadiabench/blob/ma
 ## Develop
 
 ```sh
-cargo test     # unit tests, synthetic crews of 3–20 robots, and the real binary over stdio
+cargo test     # unit tests, synthetic crews of 3–20 robots, the crew designer, and the real binary over stdio
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
@@ -85,7 +103,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ARCADIABENCH=../arcadiabench/target/release/arcadiabench cargo test --release --test bench
 ```
 
-CI runs the checks above. A separate job builds ArcadiaBench at the commit pinned in `BENCH_REF` and runs the end-to-end tests against it: the `nominal` and `conjunction` variants of catalog 1.0, and one build on each outpost of catalog 1.1.
+CI runs the checks above. A separate job builds ArcadiaBench at the commit pinned in `BENCH_REF` and runs the end-to-end tests against it: the `nominal` and `conjunction` variants of catalog 1.0, one build on each outpost of catalog 1.1, and the fleet design track with a crew of ArcadiaOS's own design.
 
 [docs/architecture.md](docs/architecture.md) describes the design, and [CHANGELOG.md](CHANGELOG.md) what each release contains.
 
