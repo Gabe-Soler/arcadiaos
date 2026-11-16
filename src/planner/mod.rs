@@ -26,6 +26,7 @@ use crate::geom::{self, Corner};
 use crate::registry::Registry;
 use crate::tasks::{Stage, Task, TaskKey};
 use crate::world::WorldModel;
+use crate::world::site::CellKnowledge;
 use arcadia_protocol::{
     CapabilityName, CellObservation, GridCoord, GridRect, LandingPadSpec, Surface,
 };
@@ -48,6 +49,21 @@ impl Busy {
     }
 }
 
+/// How a compacted or sintered cell measures up against the pad's limits.
+/// Ordered from best to worst, so the worst of several checks is their
+/// maximum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Fit {
+    /// Within every limit, clear of the scans' noise.
+    Good,
+    /// Fine itself, but a neighbour it steps too far from is being redone.
+    Waiting,
+    /// Too close to a limit to call: more scans will tell.
+    Unsure,
+    /// Outside a limit: redo it.
+    Bad,
+}
+
 /// What one pad cell needs next.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CellStatus {
@@ -65,6 +81,9 @@ pub struct CellStatus {
     pub compact: bool,
     /// Ready to sinter.
     pub sinter: bool,
+    /// Compacted or sintered, but its scans cannot yet say whether it is
+    /// within the pad's limits: scan it again.
+    pub measure: bool,
     /// In the required surface state and within tolerance.
     pub finished: bool,
     /// Finished and covered by a scan since its last change.
@@ -196,6 +215,10 @@ pub struct Planner {
     /// Whether any robot can haul; without one, spoil is cast straight into
     /// fill and berm cells at any distance.
     haulers: bool,
+    /// Whether a compacted cell is measured until its fit is clear before
+    /// it is sintered: when sintering a cell takes this crew long enough
+    /// that redoing one costs far more than the scans that prevent it.
+    careful: bool,
 }
 
 fn surface_level(s: Surface) -> u8 {
@@ -311,6 +334,16 @@ impl Planner {
             strict: BTreeSet::new(),
             recheck: Recheck::default(),
             haulers: !reg.capable(CapabilityName::Haul).is_empty(),
+            careful: {
+                // The quickest sinterer's time on one cell.
+                let cell_m2 = world.site.cell_area_m2();
+                let quickest = reg
+                    .capable(CapabilityName::Sinter)
+                    .into_iter()
+                    .map(|r| reg.work_s(r, CapabilityName::Sinter, cell_m2, cfg.min_work_s))
+                    .fold(f64::INFINITY, f64::min);
+                quickest.is_finite() && quickest >= cfg.careful_sinter_s
+            },
         }
     }
 
@@ -352,6 +385,104 @@ impl Planner {
         }
     }
 
+    /// The level digging, filling and grading work towards: the target,
+    /// raised by what compaction will take off again. A cell graded there
+    /// settles onto the target.
+    pub fn grade_level(&self, cfg: &Config) -> f64 {
+        self.pad.target_elevation_m + cfg.compact_settle_m.max(0.0)
+    }
+
+    /// The most two neighbouring pad cells may differ in height, m.
+    fn max_step_m(&self, world: &WorldModel) -> f64 {
+        self.pad.max_slope_deg.to_radians().tan() * world.site.cell_size_m
+    }
+
+    /// Whether the compacted or sintered cell `c` is within the pad's
+    /// limits, as far as its scans can tell: its height against the
+    /// tolerance, and the step to each neighbour that has also been
+    /// compacted against the slope limit.
+    fn fit(&self, world: &WorldModel, c: GridCoord, k: &CellKnowledge, cfg: &Config) -> Fit {
+        let (Some(e), true) = (k.elevation_m, k.samples > 0) else {
+            return Fit::Unsure;
+        };
+        let (noise, z, cap) = (cfg.scan_noise_m, cfg.measure_z, cfg.measure_max_samples);
+        // A measured value against a limit: clear of it by `z` standard
+        // errors either way, or too close to call. A cell scanned `cap`
+        // times is taken at its mean.
+        let judge = |value: f64, limit: f64, se: f64, capped: bool| {
+            if value - z * se > limit {
+                Fit::Bad
+            } else if value + z * se <= limit || (capped && value <= limit) {
+                Fit::Good
+            } else if capped {
+                Fit::Bad
+            } else {
+                Fit::Unsure
+            }
+        };
+        let target = self.pad.target_elevation_m;
+        let sintered = k.surface == Surface::Stabilized;
+        // Before sintering a cell must be inside the tolerance with room
+        // to spare; a sintered one is only redone when it is truly outside.
+        let tolerance = if sintered || !self.pad.stabilize {
+            self.pad.surface_tolerance_m + cfg.rework_margin_m
+        } else {
+            self.pad.surface_tolerance_m - cfg.presinter_margin_m
+        };
+        let se = k.std_err(noise);
+        let mut worst = judge((e - target).abs(), tolerance, se, k.samples >= cap);
+        if worst == Fit::Bad {
+            return Fit::Bad;
+        }
+        let step = self.max_step_m(world);
+        let neighbours = [
+            (c.x.wrapping_sub(1), c.y),
+            (c.x + 1, c.y),
+            (c.x, c.y.wrapping_sub(1)),
+            (c.x, c.y + 1),
+        ];
+        for (x, y) in neighbours {
+            let n = GridCoord { x, y };
+            if !geom::contains(&self.pad.area, n) {
+                continue;
+            }
+            let Some(q) = world.site.get(n) else { continue };
+            if !matches!(q.surface, Surface::Compacted | Surface::Stabilized) || q.stale {
+                continue;
+            }
+            let pair = match (q.elevation_m, q.samples > 0) {
+                (Some(eq), true) => {
+                    let se = (se * se + q.std_err(noise).powi(2)).sqrt();
+                    let capped = k.samples >= cap && q.samples >= cap;
+                    match judge((e - eq).abs(), step, se, capped) {
+                        // One of the two has to be redone: the unsintered
+                        // one if only one is sintered, else the one further
+                        // from the target. The other waits for it.
+                        Fit::Bad => {
+                            let mine = match (sintered, q.surface == Surface::Stabilized) {
+                                (false, true) => true,
+                                (true, false) => false,
+                                _ => {
+                                    let (a, b) = ((e - target).abs(), (eq - target).abs());
+                                    a > b || (a == b && (c.x, c.y) > (n.x, n.y))
+                                }
+                            };
+                            if mine { Fit::Bad } else { Fit::Waiting }
+                        }
+                        other => other,
+                    }
+                }
+                // The neighbour has not been measured since it settled.
+                _ => Fit::Unsure,
+            };
+            worst = worst.max(pair);
+            if worst == Fit::Bad {
+                break;
+            }
+        }
+        worst
+    }
+
     /// What pad cell `c` needs next.
     pub fn cell_status(&self, world: &WorldModel, c: GridCoord, cfg: &Config) -> CellStatus {
         let mut st = CellStatus::default();
@@ -365,8 +496,10 @@ impl Planner {
                 return st;
             }
         };
-        let target = self.pad.target_elevation_m;
-        let delta = elev - target;
+        // Earthworks aim at the grade level; only a compacted cell is
+        // judged against the target itself.
+        let aim = self.grade_level(cfg);
+        let rough = elev - aim;
         let site = &world.site;
         // Where grading was refused, assume a much narrower window.
         let strict = self.strict.contains(&(c.x, c.y));
@@ -380,13 +513,22 @@ impl Planner {
                 cfg.grade_window_m - 0.03,
             )
         };
-        let low = delta < -fill_trigger;
-        let fill_kg = site.mass_for_height(c, (target - fill_aim - elev).max(0.0), cfg);
-        st.max_fill_kg =
-            site.mass_for_height(c, (target + cfg.overfill_limit_m - elev).max(0.0), cfg);
+        let low = rough < -fill_trigger;
+        let fill_kg = site.mass_for_height(c, (aim - fill_aim - elev).max(0.0), cfg);
+        st.max_fill_kg = site.mass_for_height(c, (aim + cfg.overfill_limit_m - elev).max(0.0), cfg);
         let boulders = k.boulder_volume_m3.unwrap_or(0.0) > 1e-9;
-        let in_tol = delta.abs() <= self.pad.surface_tolerance_m + cfg.rework_margin_m;
         let rework = self.rework.contains(&(c.x, c.y));
+        // Back to earthworks: cut, fill or regrade, whichever the height
+        // calls for.
+        let redo = |st: &mut CellStatus| {
+            if boulders || rough > safe {
+                st.dig = true;
+            } else if rough < -safe {
+                st.fill_kg = fill_kg;
+            } else {
+                st.grade = true;
+            }
+        };
         match k.surface {
             Surface::Natural | Surface::Stockpile | Surface::Berm | Surface::Unknown => {
                 st.dig = true;
@@ -395,28 +537,42 @@ impl Planner {
                 }
             }
             Surface::Cleared => {
-                st.dig = boulders || delta > cut_trigger;
+                st.dig = boulders || rough > cut_trigger;
                 if low {
                     st.fill_kg = fill_kg;
                 }
                 st.grade = !st.dig && !low;
             }
-            Surface::Graded | Surface::Compacted | Surface::Stabilized => {
-                let wrong_finish = k.surface == Surface::Stabilized && !self.pad.stabilize;
-                if !in_tol || rework || boulders || wrong_finish {
-                    if boulders || delta > safe {
-                        st.dig = true;
-                    } else if delta < -safe {
-                        st.fill_kg = fill_kg;
-                    } else {
-                        st.grade = true;
-                    }
-                } else if k.surface == self.required_surface() {
-                    st.finished = true;
-                } else if k.surface == Surface::Graded {
-                    st.compact = true;
+            Surface::Graded => {
+                let level = rough.abs() <= self.pad.surface_tolerance_m + cfg.rework_margin_m;
+                if !level || rework || boulders {
+                    redo(&mut st);
                 } else {
-                    st.sinter = true;
+                    st.compact = true;
+                }
+            }
+            Surface::Compacted | Surface::Stabilized => {
+                let wrong_finish = k.surface == Surface::Stabilized && !self.pad.stabilize;
+                let last = k.surface == self.required_surface();
+                let fit = if rework || boulders || wrong_finish {
+                    Fit::Bad
+                } else {
+                    self.fit(world, c, k, cfg)
+                };
+                match fit {
+                    Fit::Bad => redo(&mut st),
+                    // A finished cell stays finished while its scans are
+                    // inconclusive: only a clear miss is worth redoing it.
+                    _ if last => {
+                        st.finished = true;
+                        st.measure = self.careful && fit == Fit::Unsure;
+                    }
+                    Fit::Good => st.sinter = true,
+                    // Where sintering is quick, a cell that is not clearly
+                    // wrong is sintered, and put right afterwards if need be.
+                    _ if !self.careful => st.sinter = true,
+                    Fit::Unsure => st.measure = true,
+                    Fit::Waiting => {}
                 }
             }
         }
@@ -446,9 +602,12 @@ impl Planner {
     pub fn tasks(&self, world: &WorldModel, busy: &Busy, cfg: &Config) -> Vec<Task> {
         let mut out = Vec::new();
         let target = self.pad.target_elevation_m;
+        let aim = self.grade_level(cfg);
         let cell_area = world.site.cell_area_m2();
         let mut survey: Vec<Vec<GridCoord>> = vec![Vec::new(); self.sections.len()];
         let mut to_verify: Vec<(u32, GridCoord)> = Vec::new();
+        let mut to_measure: Vec<(u32, GridCoord)> = Vec::new();
+        let mut ready_to_sinter = 0usize;
         let mut unfinished = 0usize;
         for (rank, &c) in self.order.iter().enumerate() {
             let st = self.cell_status(world, c, cfg);
@@ -470,12 +629,17 @@ impl Planner {
                 seq: rank as f64,
                 amount,
                 max_kg,
-                elevation_m: target,
+                // Earthworks go to the grade level; nothing else uses it.
+                elevation_m: if matches!(stage, Stage::Dig | Stage::Grade) {
+                    aim
+                } else {
+                    target
+                },
                 section: Some(section),
                 cast_to: None,
             };
             if st.dig {
-                out.push(task(Stage::Dig, world.site.dig_units_m3(c, target), 0.0));
+                out.push(task(Stage::Dig, world.site.dig_units_m3(c, aim), 0.0));
             }
             if st.fill_kg >= cfg.min_haul_kg {
                 out.push(task(Stage::Fill, st.fill_kg, st.max_fill_kg));
@@ -488,6 +652,10 @@ impl Planner {
             }
             if st.sinter {
                 out.push(task(Stage::Sinter, cell_area, 0.0));
+                ready_to_sinter += 1;
+            }
+            if st.measure {
+                to_measure.push((rank as u32, c));
             }
             if st.finished && !st.verified {
                 to_verify.push((rank as u32, c));
@@ -509,9 +677,24 @@ impl Planner {
             }
         }
         let endgame = unfinished <= cfg.endgame_cells;
+        // One scan serves both ends: verifying finished cells, and
+        // measuring compacted ones until their scans can tell whether they
+        // are fit to sinter. Measuring goes in batches unless the sinterers
+        // are about to run out of cells that have passed.
+        let verify_now =
+            !to_verify.is_empty() && (to_verify.len() >= cfg.verify_batch_cells || endgame);
+        let measure_now = !to_measure.is_empty()
+            && (to_measure.len() >= cfg.verify_batch_cells
+                || endgame
+                || ready_to_sinter < cfg.measure_ahead_cells);
+        if verify_now {
+            to_measure.extend(to_verify.iter().copied());
+        } else if !measure_now {
+            to_measure.clear();
+        }
+        let to_verify = to_measure;
         if !to_verify.is_empty()
             && !busy.keys.contains(&TaskKey::Verify)
-            && (to_verify.len() >= cfg.verify_batch_cells || endgame)
             && let Some(area) = geom::bounding_rect(to_verify.iter().map(|v| v.1))
         {
             let seq = to_verify.iter().map(|v| v.0).min().unwrap_or(0);
@@ -699,7 +882,7 @@ impl Planner {
         };
         let span = f64::from(geom::width(&self.pad.area).max(geom::height(&self.pad.area)));
         let haul_trip_m = (span / 2.0 + 3.0) * cs;
-        let target = self.pad.target_elevation_m;
+        let aim = self.grade_level(cfg);
         let mut w = Workload::new();
         let mut add = |cap: CapabilityName, units: f64, steps: f64, travel: f64, passes: f64| {
             let e = w.entry(cap).or_insert(CapWork {
@@ -727,7 +910,7 @@ impl Planner {
             if surveying || st.dig || level < 1 {
                 add(
                     CapabilityName::Dig,
-                    world.site.dig_units_m3(c, target),
+                    world.site.dig_units_m3(c, aim),
                     1.0,
                     cs,
                     1.0,

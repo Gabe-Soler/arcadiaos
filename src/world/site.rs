@@ -5,18 +5,33 @@
 //! every completed command. Each cell keeps the time of its last known change
 //! and the issue time of the latest scan that covered it afterwards, which is
 //! what verification needs.
+//!
+//! A scan reads elevation with noise, so one reading cannot tell whether a
+//! cell is a centimetre inside a limit or outside it. Every scan of a cell
+//! whose surface has not moved since is therefore another sample of the same
+//! height: the estimate is their mean, and [`CellKnowledge::std_err`] says
+//! how far it can be trusted.
 
 use crate::config::Config;
 use arcadia_protocol::{CellObservation, GridCoord, SiteMap, Surface};
 use std::f64::consts::PI;
+
+/// A reading this far from the mean of the earlier ones is not noise: the
+/// surface is not what it was thought to be, and the reading starts afresh, m.
+const RESCAN_JUMP_M: f64 = 0.05;
 
 /// Knowledge about one cell.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CellKnowledge {
     /// Orbital prior elevation, m.
     pub prior_elevation_m: Option<f64>,
-    /// Best current estimate of the surface elevation, m (scan or modelled).
+    /// Best current estimate of the surface elevation, m: the mean of the
+    /// scans since the surface last moved, or a modelled value before any.
     pub elevation_m: Option<f64>,
+    /// Scans of this cell since its surface last moved.
+    pub samples: u32,
+    /// When work last moved the surface (dig, fill, grade, compact).
+    pub moved_t: f64,
     /// Completion time of the latest scan of this cell.
     pub scanned_t: Option<f64>,
     /// Estimated surface state.
@@ -38,6 +53,8 @@ impl Default for CellKnowledge {
         Self {
             prior_elevation_m: None,
             elevation_m: None,
+            samples: 0,
+            moved_t: f64::NEG_INFINITY,
             scanned_t: None,
             surface: Surface::Natural,
             boulder_volume_m3: None,
@@ -65,9 +82,28 @@ impl CellKnowledge {
         self.verified_t.is_some()
     }
 
+    /// The standard error of the elevation estimate for scans of standard
+    /// deviation `noise_m`: infinite until a scan has measured the surface
+    /// as it now is.
+    pub fn std_err(&self, noise_m: f64) -> f64 {
+        if self.samples == 0 {
+            f64::INFINITY
+        } else {
+            noise_m / f64::from(self.samples).sqrt()
+        }
+    }
+
+    /// The cell changed without its height changing (it was sintered).
     fn changed(&mut self, t: f64) {
         self.changed_t = t;
         self.verified_t = None;
+    }
+
+    /// Work moved the surface: earlier scans no longer measure it.
+    fn moved(&mut self, t: f64) {
+        self.changed(t);
+        self.moved_t = t;
+        self.samples = 0;
     }
 }
 
@@ -155,7 +191,27 @@ impl SiteKnowledge {
             };
             let cell = &obs.cell;
             if let Some(e) = cell.elevation_m.filter(|e| e.is_finite()) {
-                k.elevation_m = Some(e);
+                // The same surface as before, as far as this scan shows:
+                // the state it reports, and a height within reach of noise.
+                let same = !k.stale
+                    && cell.surface.is_none_or(|s| s == k.surface)
+                    && k.elevation_m
+                        .is_some_and(|m| (e - m).abs() <= RESCAN_JUMP_M);
+                match k.elevation_m {
+                    // Another reading of a surface that has not moved since
+                    // the scan was sent: average it in.
+                    Some(mean) if same && k.samples > 0 && k.moved_t <= issued_t => {
+                        let n = f64::from(k.samples);
+                        k.elevation_m = Some((mean * n + e) / (n + 1.0));
+                        k.samples += 1;
+                    }
+                    _ => {
+                        k.elevation_m = Some(e);
+                        // A scan sent before the surface last moved may have
+                        // read it either way: it counts as no sample.
+                        k.samples = u32::from(k.moved_t <= issued_t);
+                    }
+                }
             }
             if let Some(s) = cell.surface {
                 k.surface = s;
@@ -196,7 +252,7 @@ impl SiteKnowledge {
         }
         k.surface = Surface::Cleared;
         k.boulder_volume_m3 = Some(0.0);
-        k.changed(t);
+        k.moved(t);
         spoil
     }
 
@@ -224,7 +280,7 @@ impl SiteKnowledge {
         if let Some(k) = self.get_mut(c) {
             k.elevation_m = Some(target_m);
             k.surface = Surface::Graded;
-            k.changed(t);
+            k.moved(t);
         }
     }
 
@@ -233,7 +289,7 @@ impl SiteKnowledge {
         if let Some(k) = self.get_mut(c) {
             k.elevation_m = k.elevation().map(|e| e - settle_m);
             k.surface = Surface::Compacted;
-            k.changed(t);
+            k.moved(t);
         }
     }
 
@@ -261,7 +317,7 @@ impl SiteKnowledge {
             } else {
                 Surface::Cleared
             };
-            k.changed(t);
+            k.moved(t);
         }
     }
 
@@ -273,7 +329,7 @@ impl SiteKnowledge {
         let dh = kg / (self.density(c, cfg) * self.cell_area_m2());
         if let Some(k) = self.get_mut(c) {
             k.elevation_m = k.elevation().map(|e| e - dh);
-            k.changed(t);
+            k.moved(t);
         }
     }
 

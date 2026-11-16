@@ -660,12 +660,14 @@ impl State {
                 a.planned.energy_factor.max(1e-9),
                 a.planned.duration_factor.max(1e-9),
             );
+            let tool_work = matches!(&a.job, Job::Work { task, .. } if crate::health::is_tool_work(task.capability()));
             self.health.calibrate(
                 r,
                 plan.energy_wh / fe,
                 *energy_used_wh,
                 plan.duration_s / fd,
                 t - a.issued_t,
+                tool_work,
             );
         }
         // Refused again and again, for whatever reason: give the robot a rest.
@@ -716,7 +718,7 @@ impl State {
             }
             Job::Repair { target, .. } => {
                 if done {
-                    self.health.repaired(target, cfg);
+                    self.health.repaired(&self.world, target, cfg);
                     self.capacity_dirty = true;
                 } else if !cancelled {
                     self.exec.back_off_robot(r, t + RECOVERY_BACKOFF_S);

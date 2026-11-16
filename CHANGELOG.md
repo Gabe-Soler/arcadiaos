@@ -4,7 +4,16 @@ All notable changes to ArcadiaOS. Versions follow semver.
 
 ## [Unreleased]
 
-Version 1.1.0, in development. It speaks arcadia-protocol 1.1.0, which does not work with protocol 1.0: it needs ArcadiaBench 1.1 or later. ArcadiaBench 1.1's harder default catalog is not supported yet; on its catalog 1.0 this version makes the same runs as 1.0.0.
+Version 1.1.0, in development. It speaks arcadia-protocol 1.1.0, which does not work with protocol 1.0: it needs ArcadiaBench 1.1 or later. Support for ArcadiaBench 1.1's harder default catalog is being built.
+
+### Added
+
+- **Building on ArcadiaBench's catalog 1.1,** where a square metre takes hours and tens of kilowatt-hours to sinter and compaction takes most of the tolerance off a cell.
+  - **Settlement.** Digging, filling and grading aim at the target raised by the compaction settlement the simulator states, so a cell settles onto the target.
+  - **Measured before it is sintered.** Every scan of a cell whose surface has not moved is another sample of its height, and the estimate is their mean. A compacted cell is sintered only once its scans place it inside the tolerance and within the slope limit of every compacted neighbour, clear of the scans' noise; one too close to call is scanned again, and one that fails is regraded while that still costs minutes. Of two neighbours a step too far apart, the unsintered one gives way, or else the one further from the target.
+  - **Wear from observation.** Wear is read from what a robot shows, not from assumed rates: wheel slip, motor current and dust coverage above the robot's own first readings, and for the tool the energy its work draws over the estimate. How fast it grows is what the robot, or the rest of the crew, has shown per hour since its last maintenance.
+  - **Maintenance counted for as long as it pays.** Wear keeps growing, and later maintenance would take the same wear off in its turn, so a repair's benefit is counted over that time and not over all the work left. On a build of weeks the old count made every hour look like an emergency. Of a repair and a service, the one that returns more per second of downtime is chosen, and the fixed overhead charged to a stop falls from 900 s to 300 s.
+  - **Measuring only where it pays.** A crew that sinters a cell in a minute or two, as on catalog 1.0, sinters first and reworks afterwards as before.
 
 ### Changed
 

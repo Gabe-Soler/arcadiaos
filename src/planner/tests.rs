@@ -60,6 +60,35 @@ fn world_with_crew_at(x: u32, y: u32) -> (WorldModel, Registry) {
     (w, Registry::new(&sc))
 }
 
+/// The same site with a crew whose sinterer takes `sinter_s` over a 1 m² cell.
+fn world_with_sinterer(sinter_s: f64) -> (WorldModel, Registry) {
+    let mut sc = scenario(vec![
+        robot(
+            "h",
+            0.5,
+            vec![
+                cap(CapabilityName::Haul, 3.0, 0.01, Some(400.0)),
+                cap(CapabilityName::Scan, 4.0, 0.05, None),
+            ],
+        ),
+        robot(
+            "s",
+            0.5,
+            vec![cap(CapabilityName::Sinter, 1.0 / sinter_s, 60.0, None)],
+        ),
+    ]);
+    sc.site.cell_size_m = 1.0;
+    let mut w = WorldModel::new(&sc);
+    w.fleet.update(&[state("h", 0, 0), state("s", 0, 1)]);
+    (w, Registry::new(&sc))
+}
+
+/// A crew for which sintering a cell takes hours, as on ArcadiaBench's
+/// catalog 1.1: redoing one is dear, so cells are measured first.
+fn careful_world() -> (WorldModel, Registry) {
+    world_with_sinterer(25_000.0)
+}
+
 fn observe(c: GridCoord, elev: f64, surface: Surface, boulder: bool) -> CellObservation {
     CellObservation {
         at: c,
@@ -117,10 +146,14 @@ fn sweep_starts_near_the_crew_and_sections_cover_the_pad() {
 #[test]
 fn cells_move_through_the_pipeline() {
     let cfg = Config::default();
-    let (mut w, reg) = world_with_crew_at(0, 0);
+    let (mut w, reg) = careful_world();
     let p = Planner::new("g", &pad_spec(vec![]), &w, &reg, &cfg);
     let c = GridCoord { x: 3, y: 3 };
     assert!(p.cell_status(&w, c, &cfg).survey);
+    // Earthworks aim at the grade level: the target plus what compaction
+    // will take off again.
+    let aim = p.grade_level(&cfg);
+    assert_eq!(aim, TARGET + cfg.compact_settle_m);
 
     // High natural cell with a boulder: dig only.
     w.site.apply_scan(
@@ -139,32 +172,162 @@ fn cells_move_through_the_pipeline() {
     );
     let st = p.cell_status(&w, c, &cfg);
     assert!(st.dig);
-    assert!(
-        (st.fill_kg - (0.3 - cfg.fill_aim_m) * 1500.0).abs() < 1e-6,
-        "{}",
-        st.fill_kg
-    );
+    let wanted = (aim - cfg.fill_aim_m - (TARGET - 0.3)) * 1500.0;
+    assert!((st.fill_kg - wanted).abs() < 1e-6, "{}", st.fill_kg);
     assert!(st.max_fill_kg > st.fill_kg);
 
     // Cleared and inside the window: grade.
-    w.site.record_dig(c, TARGET, 3.0, &cfg);
+    w.site.record_dig(c, aim, 3.0, &cfg);
     w.site.record_deposit(c, st.fill_kg, false, 4.0, &cfg);
     let st = p.cell_status(&w, c, &cfg);
     assert!(st.grade && !st.dig && st.fill_kg == 0.0, "{st:?}");
 
-    w.site.record_grade(c, TARGET, 5.0);
+    w.site.record_grade(c, aim, 5.0);
     assert!(p.cell_status(&w, c, &cfg).compact);
-    w.site.record_compact(c, 0.01, 6.0);
-    assert!(p.cell_status(&w, c, &cfg).sinter);
+    // Compacted, but not measured since: scan it before sintering.
+    w.site.record_compact(c, cfg.compact_settle_m, 6.0);
+    let st = p.cell_status(&w, c, &cfg);
+    assert!(st.measure && !st.sinter && !st.finished, "{st:?}");
+    w.site.apply_scan(
+        &[observe(c, TARGET + 0.004, Surface::Compacted, false)],
+        6.5,
+        6.6,
+    );
+    let st = p.cell_status(&w, c, &cfg);
+    assert!(st.sinter && !st.measure, "{st:?}");
     w.site.record_sinter(c, 7.0);
     let st = p.cell_status(&w, c, &cfg);
     assert!(st.finished && !st.verified);
     w.site.apply_scan(
-        &[observe(c, TARGET - 0.01, Surface::Stabilized, false)],
+        &[observe(c, TARGET - 0.004, Surface::Stabilized, false)],
         7.0,
         8.0,
     );
     assert!(p.cell_status(&w, c, &cfg).verified);
+    // Sintering did not move the surface: both scans count towards its height.
+    let k = w.site.get(c).unwrap();
+    assert_eq!(k.samples, 2);
+    assert!((k.elevation_m.unwrap() - TARGET).abs() < 1e-9);
+}
+
+/// A row of compacted pad cells, each scanned `scans` times at its height
+/// above the target.
+fn compacted(w: &mut WorldModel, cells: &[(GridCoord, f64)], scans: u32) {
+    for &(c, _) in cells {
+        w.site
+            .apply_scan(&[observe(c, TARGET, Surface::Compacted, false)], 0.0, 1.0);
+        w.site.record_compact(c, 0.0, 2.0);
+    }
+    for i in 0..scans {
+        let obs: Vec<CellObservation> = cells
+            .iter()
+            .map(|&(c, above)| observe(c, TARGET + above, Surface::Compacted, false))
+            .collect();
+        w.site
+            .apply_scan(&obs, 3.0 + f64::from(i), 3.5 + f64::from(i));
+    }
+}
+
+#[test]
+fn a_compacted_cell_is_measured_until_its_fit_is_clear() {
+    let cfg = Config::default();
+    let (mut w, reg) = careful_world();
+    let p = Planner::new("g", &pad_spec(vec![]), &w, &reg, &cfg);
+    let c = GridCoord { x: 3, y: 3 };
+    let status = |w: &WorldModel, c| p.cell_status(w, c, &cfg);
+    // One scan with 1 cm of noise cannot place a cell 3 cm off inside a
+    // 4.5 cm limit; a few more can.
+    compacted(&mut w, &[(c, 0.03)], 1);
+    assert!(status(&w, c).measure);
+    compacted(&mut w, &[(c, 0.03)], 4);
+    assert_eq!(w.site.get(c).unwrap().samples, 4);
+    assert!(status(&w, c).sinter);
+    // A cell clearly outside is regraded at once, while that is cheap.
+    compacted(&mut w, &[(c, 0.08)], 1);
+    let st = status(&w, c);
+    assert!(st.grade && !st.sinter && !st.measure, "{st:?}");
+    // One that stays too close to call is taken at its mean in the end.
+    compacted(&mut w, &[(c, 0.044)], cfg.measure_max_samples);
+    assert!(status(&w, c).sinter);
+    compacted(&mut w, &[(c, 0.046)], cfg.measure_max_samples);
+    assert!(status(&w, c).grade);
+}
+
+#[test]
+fn a_crew_that_sinters_quickly_does_not_wait_for_measurements() {
+    // A cell sintered in 100 s costs less to redo than to measure first:
+    // it is sintered as soon as it is compacted, unless it is clearly wrong.
+    let cfg = Config::default();
+    let (mut w, reg) = world_with_sinterer(100.0);
+    let p = Planner::new("g", &pad_spec(vec![]), &w, &reg, &cfg);
+    let (a, b) = (GridCoord { x: 3, y: 3 }, GridCoord { x: 4, y: 3 });
+    let status = |w: &WorldModel, c| p.cell_status(w, c, &cfg);
+    w.site
+        .apply_scan(&[observe(a, TARGET, Surface::Compacted, false)], 0.0, 1.0);
+    w.site.record_compact(a, 0.0, 2.0);
+    let st = status(&w, a);
+    assert!(st.sinter && !st.measure, "unmeasured: {st:?}");
+    compacted(&mut w, &[(a, 0.03)], 1);
+    assert!(status(&w, a).sinter, "too close to call");
+    compacted(&mut w, &[(a, -0.016), (b, 0.016)], 2);
+    assert!(status(&w, a).sinter && status(&w, b).sinter);
+    // Clearly outside the tolerance, or a step clearly too high: redone.
+    compacted(&mut w, &[(a, 0.08)], 1);
+    assert!(status(&w, a).grade);
+    compacted(&mut w, &[(a, -0.02), (b, 0.03)], 9);
+    assert!(status(&w, b).grade && status(&w, a).sinter);
+    // The crew of hours-long sinters would have measured that first cell.
+    let (mut w, reg) = careful_world();
+    let p = Planner::new("g", &pad_spec(vec![]), &w, &reg, &cfg);
+    w.site
+        .apply_scan(&[observe(a, TARGET, Surface::Compacted, false)], 0.0, 1.0);
+    w.site.record_compact(a, 0.0, 2.0);
+    let st = p.cell_status(&w, a, &cfg);
+    assert!(st.measure && !st.sinter, "{st:?}");
+}
+
+#[test]
+fn a_step_between_neighbours_is_settled_before_sintering() {
+    let cfg = Config::default();
+    let (mut w, reg) = careful_world();
+    let p = Planner::new("g", &pad_spec(vec![]), &w, &reg, &cfg);
+    let (a, b) = (GridCoord { x: 3, y: 3 }, GridCoord { x: 4, y: 3 });
+    let status = |w: &WorldModel, c| p.cell_status(w, c, &cfg);
+    // Two degrees over a 1 m cell is a step of 3.5 cm. Both cells are well
+    // inside the tolerance, but 5 cm apart: the one further from the target
+    // is redone, and the other waits for it.
+    compacted(&mut w, &[(a, -0.02), (b, 0.03)], 9);
+    let (sa, sb) = (status(&w, a), status(&w, b));
+    assert!(sb.grade && !sb.sinter, "{sb:?}");
+    assert!(!sa.sinter && !sa.grade && !sa.measure, "{sa:?}");
+    // Once it is regraded the pair is no longer judged, and the first cell
+    // can be sintered.
+    w.site.record_grade(b, p.grade_level(&cfg), 20.0);
+    assert!(status(&w, a).sinter);
+    assert!(status(&w, b).compact);
+    // A step too close to the limit to call is scanned again...
+    compacted(&mut w, &[(a, -0.016), (b, 0.016)], 2);
+    assert!(status(&w, a).measure && status(&w, b).measure);
+    // ...and a comfortable one passes.
+    compacted(&mut w, &[(a, -0.01), (b, 0.01)], 4);
+    assert!(status(&w, a).sinter && status(&w, b).sinter);
+    // Beside a sintered neighbour it is always the unsintered cell that
+    // gives way, even when it is the one nearer the target.
+    compacted(&mut w, &[(a, -0.035), (b, 0.012)], 9);
+    w.site.record_sinter(a, 40.0);
+    let (sa, sb) = (status(&w, a), status(&w, b));
+    assert!(sa.finished && !sa.grade, "{sa:?}");
+    assert!(sb.grade, "{sb:?}");
+    // A neighbour that is compacted but not yet measured holds a cell back.
+    let c = GridCoord { x: 3, y: 4 };
+    w.site
+        .apply_scan(&[observe(c, TARGET, Surface::Compacted, false)], 0.0, 1.0);
+    w.site.record_compact(c, 0.0, 50.0);
+    let d = GridCoord { x: 3, y: 5 };
+    compacted(&mut w, &[(d, 0.0)], 4);
+    assert!(status(&w, c).measure);
+    let sd = status(&w, d);
+    assert!(sd.measure && !sd.sinter, "{sd:?}");
 }
 
 #[test]
