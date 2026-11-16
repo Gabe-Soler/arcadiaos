@@ -4,7 +4,7 @@ ArcadiaOS: an operating system for robot crews building on Mars.
 
 ArcadiaOS decides which robot does what, when, and with how much power, while Earth supervises across a 4–24 minute delay and multi-week blackouts. It is measured on [ArcadiaBench](https://github.com/Gabe-Soler/arcadiabench), and it talks to the world only through [arcadia-protocol](https://github.com/Gabe-Soler/arcadia-protocol). That means the same coordinator can drive the simulator now and real hardware later.
 
-**Version 1.0.0**, speaking arcadia-protocol 1.0.0. It builds the landing pad of every ArcadiaBench 1.0 scenario, with any of the benchmark's crews, and has the best headline score in all 18 ([results](#results)).
+**Version 1.1.0, in development on `main`**, speaking arcadia-protocol 1.1.0, so it runs under ArcadiaBench 1.1 and later. The latest release is 1.0.0 (tag `v1.0.0`), which speaks protocol 1.0.0 and runs under ArcadiaBench 1.0; the two protocol versions do not work together. ArcadiaOS builds the landing pad of every scenario in ArcadiaBench's catalog 1.0, with any of the benchmark's crews, and has the best headline score in all 18 ([results](#results)). ArcadiaBench 1.1's harder default catalog, where the pad takes weeks, is not supported yet: name `--catalog 1.0` until it is.
 
 ## What it does
 
@@ -38,10 +38,10 @@ cargo build --release
 (cd ../arcadiabench && cargo build --release)
 
 # One run: Small crew, nominal conditions, seed 1, with its event log.
-../arcadiabench/target/release/arcadiabench run --seed 1 --log run.jsonl -- ./target/release/arcadiaos
+../arcadiabench/target/release/arcadiabench run --catalog 1.0 --seed 1 --log run.jsonl -- ./target/release/arcadiaos
 
 # Ten seeds of the Medium crew through a conjunction blackout, scored.
-../arcadiabench/target/release/arcadiabench bench --preset medium --variant conjunction --seeds 1-10 --out runs/medium-conjunction -- ./target/release/arcadiaos
+../arcadiabench/target/release/arcadiabench bench --catalog 1.0 --preset medium --variant conjunction --seeds 1-10 --out runs/medium-conjunction -- ./target/release/arcadiaos
 ```
 
 Each run prints a one-line summary, and `bench` prints its scorecard. ArcadiaBench's README covers every preset, variant and command, its replay viewer opens any saved log, and its `scripts/results.sh` reproduces the full benchmark results with this binary (it looks for it at `../arcadiaos/target/release/arcadiaos`, or wherever `ARCADIAOS` says).
@@ -50,7 +50,7 @@ ArcadiaOS writes nothing to stderr by default. Set `ARCADIAOS_LOG=info` for plan
 
 ## Results
 
-On ArcadiaBench 1.0 ([`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/arcadiabench/blob/v1.0.0/results/v1.0/RESULTS.md)), every preset and variant over seeds 1–50, ArcadiaOS completes all 900 of its runs, with no policy violation and no robot lost, and has the best headline (success rate × speed) in all 18 scenarios, 10–21% above the greedy baseline's:
+These are ArcadiaOS 1.0.0's results on ArcadiaBench 1.0 ([`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/arcadiabench/blob/v1.0.0/results/v1.0/RESULTS.md)), every preset and variant over seeds 1–50, ArcadiaOS completes all 900 of its runs, with no policy violation and no robot lost, and has the best headline (success rate × speed) in all 18 scenarios, 10–21% above the greedy baseline's:
 
 | Nominal headline | Small (4 robots) | Medium (10) | Large (20) |
 |---|---|---|---|
@@ -77,7 +77,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ARCADIABENCH=../arcadiabench/target/release/arcadiabench cargo test --release --test bench
 ```
 
-CI runs the checks above. A separate job builds ArcadiaBench at the commit pinned in `BENCH_REF` and runs the end-to-end tests (the `nominal` and `conjunction` variants) against it.
+CI runs the checks above. A separate job builds ArcadiaBench at the commit pinned in `BENCH_REF` and runs the end-to-end tests (the `nominal` and `conjunction` variants of catalog 1.0) against it.
 
 [docs/architecture.md](docs/architecture.md) describes the design, and [CHANGELOG.md](CHANGELOG.md) what each release contains.
 

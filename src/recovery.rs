@@ -46,10 +46,6 @@ const FIRM_SEARCH_CELLS: i64 = 6;
 /// How far a stuck robot is towed towards a station when no firm cell is known, cells.
 const FREE_TOW_CELLS: f64 = 3.0;
 
-/// Work to strip a donor and fit its parts, in repair units (interface
-/// assumption: 0.5 to strip, 1.0 to install).
-const CANNIBALIZE_UNITS: f64 = 1.5;
-
 /// One step that moves a disabled robot towards working again.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
@@ -422,7 +418,7 @@ fn cannibalize_options(ctx: &Ctx, target: usize, pos: GridCoord, helpers: &[usiz
         let Some(rpos) = ctx.pos(r) else { continue };
         for donor in donors(ctx, target, r) {
             let Some(dpos) = ctx.pos(donor) else { continue };
-            let units = CANNIBALIZE_UNITS;
+            let units = cfg.cannibalize_units;
             let wh = reg.travel_wh(r, rpos, dpos)
                 + reg.travel_wh(r, dpos, pos)
                 + reg.work_wh(r, CapabilityName::Repair, units, cfg.min_work_s);
@@ -582,6 +578,7 @@ mod tests {
             faults: vec![],
             in_relay_coverage: true,
             telemetry_t: 0.0,
+            tank_wh: None,
         }
     }
 

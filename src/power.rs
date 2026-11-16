@@ -11,9 +11,13 @@
 //! Charging a robot needs to work is never held back; when the bank is empty
 //! the delivered fraction slows it, and the energy policy plans for that.
 //!
-//! Robot heaters run on cold nights and add to idle drain. The cold window is
-//! an assumption ([`Config::cold_from_phase`] to [`Config::cold_to_phase`]),
-//! deliberately wider than the reference simulator's.
+//! Robot heaters run while the air is colder than a threshold, and add to
+//! idle drain. When that will be is forecast as a window of the sol. It
+//! starts as an assumption ([`Config::cold_from_phase`] to
+//! [`Config::cold_to_phase`]), deliberately wider than the reference
+//! simulator's, and is moved by any temperature seen on the wrong side of
+//! the threshold ([`Config::heater_threshold_c`], which a protocol 1.1
+//! simulator sends).
 
 use crate::config::Config;
 use crate::world::WorldModel;
@@ -34,7 +38,19 @@ pub struct PowerModel {
     pub sol_s: f64,
     /// Dust transmittance last measured in daylight.
     transmittance: f64,
+    /// The cold window in use, as sol phases (from, to) across midnight;
+    /// the assumed one until a temperature contradicts it.
+    cold: Option<(f64, f64)>,
+    /// When the weather report last used for the cold window was made.
+    cold_seen_t: f64,
 }
+
+/// A sol phase is moved this far past a contradicting reading.
+const COLD_EDGE_STEP: f64 = 0.005;
+
+/// A robot's own temperature reading counts as cold air only this far under
+/// the heater threshold, °C: telemetry is noisy.
+const READING_MARGIN_C: f64 = 2.0;
 
 /// What the forecast expects of the bank.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,6 +70,52 @@ impl PowerModel {
             system,
             sol_s: if sol_s > 0.0 { sol_s } else { 88_775.0 },
             transmittance: 1.0,
+            cold: None,
+            cold_seen_t: f64::NEG_INFINITY,
+        }
+    }
+
+    /// The cold window in use: sol phases (from, to), across midnight.
+    pub fn cold_window(&self, cfg: &Config) -> (f64, f64) {
+        self.cold
+            .unwrap_or((cfg.cold_from_phase, cfg.cold_to_phase))
+    }
+
+    /// Take in an air temperature measured at `t`. One on the wrong side of
+    /// the heater threshold moves the nearer edge of the cold window just
+    /// past it; one that agrees with the window changes nothing.
+    pub fn observe_air(&mut self, t: f64, air_c: f64, cfg: &Config) {
+        if !air_c.is_finite() {
+            return;
+        }
+        let (mut from, mut to) = self.cold_window(cfg);
+        let p = self.phase(t);
+        let inside = p >= from || p < to;
+        let is_cold = air_c < cfg.heater_threshold_c;
+        if is_cold == inside {
+            return;
+        }
+        // Distances round the sol from `p` forward to each edge.
+        let ahead = |edge: f64| (edge - p).rem_euclid(1.0);
+        let behind = |edge: f64| (p - edge).rem_euclid(1.0);
+        if is_cold {
+            // Cold outside the window: the window grows to take `p` in,
+            // from whichever edge is nearer.
+            if ahead(from) <= behind(to) {
+                from = (p - COLD_EDGE_STEP).rem_euclid(1.0);
+            } else {
+                to = (p + COLD_EDGE_STEP).rem_euclid(1.0);
+            }
+        } else if behind(from) <= ahead(to) {
+            // Warm inside the window, nearer its start: it starts later.
+            from = (p + COLD_EDGE_STEP).rem_euclid(1.0);
+        } else {
+            to = p;
+        }
+        // The window always crosses midnight: an evening edge and a
+        // morning edge. Evidence that would break that shape is not taken.
+        if from > 0.5 && to < 0.5 {
+            self.cold = Some((from, to));
         }
     }
 
@@ -85,8 +147,29 @@ impl PowerModel {
     }
 
     /// Take in the latest reports: daylight `power` events measure the dust
-    /// transmittance, and a `weather` report of clear sky resets it.
-    pub fn observe(&mut self, world: &WorldModel) {
+    /// transmittance, a `weather` report of clear sky resets it, and the air
+    /// temperature in a `weather` report is checked against the cold window.
+    pub fn observe(&mut self, world: &WorldModel, cfg: &Config) {
+        if let Some(w) = &world.weather
+            && w.t > self.cold_seen_t
+        {
+            self.cold_seen_t = w.t;
+            self.observe_air(w.t, w.temperature_c, cfg);
+        }
+        // A robot reads the air's temperature, or warmer while its heater
+        // runs, so one that reads well under the threshold is in cold air.
+        let coldest = world
+            .fleet
+            .iter()
+            .filter_map(|(_, e)| e.state.as_ref())
+            .map(|s| (s.health.temperature_c, s.telemetry_t))
+            .filter(|(c, _)| c.is_finite())
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some((reading_c, at)) = coldest
+            && reading_c < cfg.heater_threshold_c - READING_MARGIN_C
+        {
+            self.observe_air(at, reading_c, cfg);
+        }
         if let Some(p) = &world.power {
             let clear = self.clear_sky_w(p.t);
             if p.daylight && clear > MIN_SUN_FRAC * self.system.solar_peak_w.max(1.0) {
@@ -202,17 +285,18 @@ impl PowerModel {
             .min(now_fraction)
     }
 
-    /// Seconds of the assumed cold window within `[from, to]`.
+    /// Seconds of the cold window within `[from, to]`.
     pub fn cold_s(&self, from: f64, to: f64, cfg: &Config) -> f64 {
         if to <= from {
             return 0.0;
         }
+        let (cold_from, cold_to) = self.cold_window(cfg);
         let mut total = 0.0;
         let mut sol = (from / self.sol_s).floor() - 1.0;
         while sol * self.sol_s <= to {
             // The window starting this sol runs into the next one.
-            let start = (sol + cfg.cold_from_phase) * self.sol_s;
-            let end = (sol + 1.0 + cfg.cold_to_phase) * self.sol_s;
+            let start = (sol + cold_from) * self.sol_s;
+            let end = (sol + 1.0 + cold_to) * self.sol_s;
             let a = start.max(from);
             let b = end.min(to);
             if b > a {
@@ -223,10 +307,11 @@ impl PowerModel {
         total
     }
 
-    /// Whether the assumed cold window covers `t`.
+    /// Whether the cold window covers `t`.
     pub fn cold(&self, t: f64, cfg: &Config) -> bool {
         let p = self.phase(t);
-        p >= cfg.cold_from_phase || p < cfg.cold_to_phase
+        let (from, to) = self.cold_window(cfg);
+        p >= from || p < to
     }
 }
 
@@ -306,7 +391,7 @@ mod tests {
         assert!(m.optional_charging_ok(&w, 3000.0, 3000.0, 0.0, &cfg));
         let noon = world_with_power(0.5 * SOL_S, 99_000.0, 100_000.0, 20_000.0);
         let mut m2 = m.clone();
-        m2.observe(&noon);
+        m2.observe(&noon, &cfg);
         assert!(m2.surplus(&noon, 0.0, &cfg));
         assert_eq!(m2.delivered_fraction(&noon, 0.0, 6000.0, 3600.0), 1.0);
     }
@@ -315,7 +400,7 @@ mod tests {
     fn dust_transmittance_is_measured_in_daylight() {
         let mut m = model(PowerMode::SolarOnly, 0.0, 30_000.0, 150_000.0);
         let w = world_with_power(0.5 * SOL_S, 80_000.0, 150_000.0, 9_000.0);
-        m.observe(&w);
+        m.observe(&w, &Config::default());
         assert!((m.supply_w(0.5 * SOL_S) - 9_000.0).abs() < 1.0);
     }
 
@@ -329,5 +414,50 @@ mod tests {
         assert!((s - 0.45 * SOL_S).abs() < 1e-6, "{s}");
         assert_eq!(m.cold_s(0.4 * SOL_S, 0.6 * SOL_S, &cfg), 0.0);
         assert!((m.cold_s(0.0, 0.1 * SOL_S, &cfg) - 0.1 * SOL_S).abs() < 1e-6);
+    }
+
+    #[test]
+    fn temperatures_on_the_wrong_side_of_the_threshold_move_the_cold_window() {
+        let cfg = Config::default();
+        let mut m = model(PowerMode::Hybrid, 10_000.0, 20_000.0, 100_000.0);
+        assert_eq!(m.cold_window(&cfg), (0.9, 0.35));
+        // Readings that agree with the assumed window change nothing.
+        m.observe_air(0.1 * SOL_S, -75.0, &cfg);
+        m.observe_air(3.6 * SOL_S, -30.0, &cfg);
+        m.observe_air(0.2 * SOL_S, f64::NAN, &cfg);
+        assert_eq!(m.cold_window(&cfg), (0.9, 0.35));
+        // Warm air at phase 0.33, inside the window near its morning edge:
+        // the window ends there.
+        m.observe_air(2.33 * SOL_S, -55.0, &cfg);
+        let (from, to) = m.cold_window(&cfg);
+        assert_eq!(from, 0.9);
+        assert!((to - 0.33).abs() < 1e-9, "{to}");
+        assert!(!m.cold(5.34 * SOL_S, &cfg) && m.cold(5.32 * SOL_S, &cfg));
+        // Cold air at phase 0.86, before the evening edge: it starts sooner.
+        m.observe_air(4.86 * SOL_S, -61.0, &cfg);
+        let (from, to) = m.cold_window(&cfg);
+        assert!((from - 0.855).abs() < 1e-9, "{from}");
+        assert!((to - 0.33).abs() < 1e-9);
+        assert!(m.cold(7.87 * SOL_S, &cfg));
+        // The forecast of cold hours follows: one whole night is now
+        // (1 - 0.855) + 0.33 of a sol.
+        let night = m.cold_s(0.5 * SOL_S, 1.5 * SOL_S, &cfg);
+        assert!((night - 0.475 * SOL_S).abs() < 1e-6, "{night}");
+        // The simulator's own threshold decides what counts as cold.
+        let milder = Config {
+            heater_threshold_c: -40.0,
+            ..Config::default()
+        };
+        let mut m = model(PowerMode::Hybrid, 10_000.0, 20_000.0, 100_000.0);
+        m.observe_air(0.8 * SOL_S, -45.0, &milder);
+        assert!((m.cold_window(&milder).0 - 0.795).abs() < 1e-9);
+        // A cold morning stretches the window towards noon, but an edge
+        // never crosses noon: the window keeps an evening and a morning end.
+        let mut m = model(PowerMode::Hybrid, 10_000.0, 20_000.0, 100_000.0);
+        m.observe_air(0.45 * SOL_S, -90.0, &cfg);
+        let (from, to) = m.cold_window(&cfg);
+        assert!(from == 0.9 && (to - 0.455).abs() < 1e-9, "{to}");
+        m.observe_air(0.52 * SOL_S, -90.0, &cfg);
+        assert_eq!(m.cold_window(&cfg), (from, to));
     }
 }

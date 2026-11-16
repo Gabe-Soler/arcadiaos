@@ -73,6 +73,7 @@ fn hello_with(version: &str, size: u32) -> SimToCoordinator {
                     default_fallback: Fallback::Abort,
                 },
             },
+            constants: None,
         },
     }))
 }
@@ -107,6 +108,7 @@ fn robot_state(id: &str, x: u32, y: u32) -> RobotState {
         faults: vec![],
         in_relay_coverage: true,
         telemetry_t: 0.0,
+        tank_wh: None,
     }
 }
 
@@ -225,15 +227,34 @@ fn handshake_decisions_and_end() {
 
 #[test]
 fn rejects_incompatible_version() {
-    let (replies, ok) = session(&[hello("9.9.0")]);
-    assert!(!ok);
-    assert!(matches!(
-        replies.as_slice(),
-        [CoordinatorToSim::Error(ErrorMessage {
-            code: ErrorCode::VersionMismatch,
-            ..
-        })]
-    ));
+    // Another major version, and protocol 1.0: 1.1 changed how versions
+    // are told apart, so a 1.0 simulator and this coordinator do not mix.
+    for version in ["9.9.0", "1.0.0", "0.2.0"] {
+        let (replies, ok) = session(&[hello(version)]);
+        assert!(!ok, "{version}");
+        assert!(
+            matches!(
+                replies.as_slice(),
+                [CoordinatorToSim::Error(ErrorMessage {
+                    code: ErrorCode::VersionMismatch,
+                    ..
+                })]
+            ),
+            "{version}: {replies:?}"
+        );
+    }
+}
+
+#[test]
+fn welcomes_a_later_minor_version_of_the_protocol() {
+    // From 1.1 on a minor version only adds, so a 1.2 simulator is one
+    // this coordinator can work with.
+    let (replies, ok) = session(&[hello("1.2.0")]);
+    assert!(ok);
+    assert!(
+        matches!(replies.as_slice(), [CoordinatorToSim::Welcome(w)] if w.protocol_version == PROTOCOL_VERSION),
+        "{replies:?}"
+    );
 }
 
 #[test]

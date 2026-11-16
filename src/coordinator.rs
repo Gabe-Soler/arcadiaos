@@ -85,6 +85,10 @@ const RESERVE: &str = "charging from the site energy reserve";
 /// Decision-making core. The session loop in [`crate::run`] feeds it observations.
 #[derive(Debug, Clone, Default)]
 pub struct Coordinator {
+    /// The configuration as given: assumptions and policy.
+    base: Config,
+    /// The one in use: `base`, with the constants the simulator sent in
+    /// `hello` in place of the assumed ones.
     cfg: Config,
     diag: Diag,
     state: Option<State>,
@@ -205,6 +209,7 @@ impl Coordinator {
     /// A coordinator with explicit tuning and diagnostics.
     pub fn with_config(cfg: Config, diag: Diag) -> Self {
         Self {
+            base: cfg.clone(),
             cfg,
             diag,
             state: None,
@@ -216,6 +221,26 @@ impl Coordinator {
     pub fn start(&mut self, hello: Box<Hello>) {
         let world = WorldModel::new(&hello.scenario);
         let reg = Registry::new(&hello.scenario);
+        // A simulator on protocol 1.1 says how its world works; one on 1.0
+        // says nothing, and the assumed values stand.
+        self.cfg = match &hello.scenario.constants {
+            Some(sent) => self.base.clone().with_constants(sent),
+            None => self.base.clone(),
+        };
+        let told = hello.scenario.constants.is_some();
+        self.diag.info(world.now, || {
+            if told {
+                format!(
+                    "constants from the simulator: settlement {} m, min work {} s, service {} s, Earth answers in about {} s",
+                    self.cfg.compact_settle_m,
+                    self.cfg.min_work_s,
+                    self.cfg.service_s,
+                    self.cfg.earth_response_s
+                )
+            } else {
+                "no constants from the simulator: using the assumed ones".into()
+            }
+        });
         self.diag.info(world.now, || {
             format!(
                 "run {}: {} robots, {} stations, {} depots, site {}x{} cells of {} m, power {:?}",
@@ -400,6 +425,16 @@ impl State {
             self.same_time = (t, 1);
         }
         self.world.fleet.update(&obs.robots);
+        // A mobile charger's own reading of its tank, when the snapshot is
+        // current: a robot out of coverage shows an old one, and what it
+        // has handed out since is only in the running estimate.
+        for s in &obs.robots {
+            if let (Some(wh), Some(r)) = (s.tank_wh, self.world.fleet.index_of(&s.robot_id))
+                && s.in_relay_coverage
+            {
+                self.energy.observe_tank(r, wh);
+            }
+        }
         for r in 0..self.reg.len() {
             let lost = self.world.fleet.get(r).lost();
             if lost && !self.lost_marks[r] {
@@ -413,7 +448,7 @@ impl State {
             self.on_event(e, cfg, diag);
         }
         self.health.observe(&self.world, cfg);
-        self.power.observe(&self.world);
+        self.power.observe(&self.world, cfg);
         for r in 0..self.reg.len() {
             self.reg.set_perf(r, self.health.perf(&self.world, r, cfg));
             // A fault appearing or clearing changes the robot's rates: re-plan roles.
@@ -543,6 +578,15 @@ impl State {
                         .insert(p.goal_id.clone(), p.priority);
                 }
             }
+            // A goal with an objective, or a message, that this version
+            // does not know: a later minor version of the protocol may send
+            // one. There is nothing to do with it.
+            Uplink::Goal { goal_id, .. } => {
+                diag.info(self.world.now, || {
+                    format!("ignoring goal {goal_id}: its objective is not one this version builds")
+                });
+            }
+            Uplink::Unknown => {}
         }
     }
 
@@ -856,7 +900,8 @@ impl State {
             }
             // The authority layer asks Earth before acting, so these should not
             // happen; if one does, the task waits out a back-off.
-            RejectReason::ApprovalRequired | RejectReason::Vetoed => {
+            // A reason this version does not know is waited out the same way.
+            RejectReason::ApprovalRequired | RejectReason::Vetoed | RejectReason::Unknown => {
                 self.exec.back_off(r, task.key, t + cfg.retry_backoff_s);
             }
         }
@@ -2909,6 +2954,7 @@ mod tests {
             faults: vec![],
             in_relay_coverage: true,
             telemetry_t: 0.0,
+            tank_wh: None,
         }
     }
 
@@ -2968,6 +3014,71 @@ mod tests {
         );
         let s = os.summary();
         assert_eq!((s.decisions, s.commands, s.cells_total), (1, 2, 9));
+    }
+
+    #[test]
+    fn the_simulators_constants_are_used_when_hello_carries_them() {
+        let mut os = Coordinator::with_config(Config::default(), Diag::new(Level::Off));
+        // A hello without constants, as a protocol 1.0 simulator's was.
+        os.start(hello());
+        assert_eq!(os.cfg, Config::default());
+        assert_eq!(os.state.as_ref().unwrap().service_s, 7200.0);
+        // One with them: the simulator's values are the ones in use.
+        let mut told = hello();
+        told.scenario.constants = Some(Constants {
+            depot_service_s: 3600.0,
+            ..crate::config::tests::sent()
+        });
+        os.start(told);
+        assert_eq!(os.cfg.compact_settle_m, 0.04);
+        assert_eq!(os.cfg.earth_response_s, 14_400.0);
+        assert_eq!(os.state.as_ref().unwrap().service_s, 3600.0);
+        // They belong to that run: the next one starts from the assumptions.
+        os.start(hello());
+        assert_eq!(os.cfg, Config::default());
+    }
+
+    #[test]
+    fn a_mobile_chargers_reported_tank_replaces_the_estimate() {
+        let mut sc = scenario(vec![
+            robot(
+                "a",
+                0.5,
+                vec![cap(CapabilityName::Sinter, 0.01, 60.0, None)],
+            ),
+            robot(
+                "c",
+                0.5,
+                vec![cap(CapabilityName::Charge, 0.5, 0.0, Some(1000.0))],
+            ),
+        ]);
+        sc.site.cell_size_m = 1.0;
+        let mut os = Coordinator::with_config(Config::default(), Diag::new(Level::Off));
+        os.start(Box::new(Hello {
+            scenario: sc,
+            ..*hello()
+        }));
+        let tank = |os: &Coordinator| os.state.as_ref().unwrap().energy.tank(1);
+        assert_eq!(tank(&os), 1000.0, "assumed full at the start");
+        let observe = |os: &mut Coordinator, seq, wh, covered| {
+            let mut c = state("c", 2, 2);
+            c.tank_wh = wh;
+            c.in_relay_coverage = covered;
+            os.decide(&Observation {
+                seq,
+                t: seq as f64 * 10.0,
+                events: vec![],
+                robots: vec![state("a", 1, 1), c],
+            });
+        };
+        observe(&mut os, 0, Some(640.0), true);
+        assert_eq!(tank(&os), 640.0);
+        // A snapshot from before the robot left coverage is not current.
+        observe(&mut os, 1, Some(900.0), false);
+        assert_eq!(tank(&os), 640.0);
+        // A simulator that reports no tank leaves the estimate alone.
+        observe(&mut os, 2, None, true);
+        assert_eq!(tank(&os), 640.0);
     }
 
     #[test]
@@ -3303,6 +3414,7 @@ mod tests {
                 cause,
                 one_way_delay_s: 720.0,
                 expected_restore_t: None,
+                window_end_t: None,
             },
         }
     }

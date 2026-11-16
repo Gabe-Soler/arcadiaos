@@ -2,10 +2,12 @@
 //! simulator.
 //!
 //! Set `ARCADIABENCH` to the path of an `arcadiabench` binary to run these;
-//! without it they print a note and pass. They use the `nominal` variant
-//! (hybrid power and the nominal fault model) and the `conjunction` variant
-//! (a two-week Earth blackout early in the run). Run them in release so the
-//! coordinator under test is the release build:
+//! without it they print a note and pass. The binary must speak this
+//! coordinator's protocol version: ArcadiaBench 1.1 or later. They use
+//! ArcadiaBench's scenario catalog 1.0, named explicitly, with the `nominal`
+//! variant (hybrid power and the nominal fault model) and the `conjunction`
+//! variant (a two-week Earth blackout early in the run). Run them in release
+//! so the coordinator under test is the release build:
 //!
 //! ```sh
 //! ARCADIABENCH=/path/to/arcadiabench cargo test --release --test bench
@@ -39,11 +41,17 @@ fn log_path(name: &str) -> PathBuf {
 /// The scenario variants the runs here use.
 const VARIANTS: [&str; 2] = ["nominal", "conjunction"];
 
+/// The ArcadiaBench scenario catalog the runs here are on. Without it
+/// ArcadiaBench uses its newest catalog.
+const CATALOG: &str = "1.0";
+
 /// Run one seed of `variant` and return the simulator's one-line summary.
 fn run(bench: &Path, variant: &str, seed: u64, log: &Path) -> String {
     let out = Command::new(bench)
         .args([
             "run",
+            "--catalog",
+            CATALOG,
             "--seed",
             &seed.to_string(),
             "--variant",
@@ -85,10 +93,12 @@ fn logged_end(log: &Path) -> (EndReason, RunMetrics, Vec<RejectReason>) {
     }
 }
 
-/// Sols from a summary like `arcadiaos 1.0.0: GoalsComplete at sol 0.78 | ...`.
+/// Sols from a summary like
+/// `arcadiaos 1.1.0 [small/nominal]: GoalsComplete after 0.78 sols | ...`.
 fn sols(summary: &str) -> Option<f64> {
-    let rest = summary.split(" at sol ").nth(1)?;
-    rest.split_whitespace().next()?.parse().ok()
+    let rest = summary.split(" after ").nth(1)?;
+    let (number, unit) = rest.split_once(' ')?;
+    unit.starts_with("sols").then(|| number.parse().ok())?
 }
 
 #[test]
@@ -167,9 +177,10 @@ fn same_seed_gives_identical_logs() {
 fn summary_parsing() {
     assert_eq!(
         sols(
-            "arcadiaos 1.0.0: GoalsComplete at sol 0.78 | pad 100% | 1833 decisions, 1837 commands"
+            "arcadiaos 1.1.0 [small/nominal]: GoalsComplete after 0.78 sols, speed 0.562 | pad 100% | 1833 decisions, 1837 commands"
         ),
         Some(0.78)
     );
     assert_eq!(sols("nothing here"), None);
+    assert_eq!(sols("ended after 3 tries"), None);
 }

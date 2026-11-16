@@ -645,7 +645,9 @@ impl Health {
             }
             units += match f.severity {
                 Severity::Degraded => cfg.repair_units_degraded,
-                Severity::Disabled => cfg.repair_units_disabled,
+                // A severity this version does not know is planned for as
+                // the worse of the two.
+                Severity::Disabled | Severity::Unknown => cfg.repair_units_disabled,
             };
         }
         if e.status() == arcadia_protocol::RobotStatus::Stuck {
@@ -795,6 +797,7 @@ mod tests {
             faults: vec![],
             in_relay_coverage: true,
             telemetry_t: t,
+            tank_wh: None,
         }
     }
 

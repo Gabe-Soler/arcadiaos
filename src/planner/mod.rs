@@ -200,7 +200,8 @@ pub struct Planner {
 
 fn surface_level(s: Surface) -> u8 {
     match s {
-        Surface::Natural | Surface::Stockpile | Surface::Berm => 0,
+        // A surface this version does not know is treated as unworked ground.
+        Surface::Natural | Surface::Stockpile | Surface::Berm | Surface::Unknown => 0,
         Surface::Cleared => 1,
         Surface::Graded => 2,
         Surface::Compacted => 3,
@@ -387,7 +388,7 @@ impl Planner {
         let in_tol = delta.abs() <= self.pad.surface_tolerance_m + cfg.rework_margin_m;
         let rework = self.rework.contains(&(c.x, c.y));
         match k.surface {
-            Surface::Natural | Surface::Stockpile | Surface::Berm => {
+            Surface::Natural | Surface::Stockpile | Surface::Berm | Surface::Unknown => {
                 st.dig = true;
                 if low {
                     st.fill_kg = fill_kg;

@@ -49,6 +49,9 @@ impl RobotEntry {
                     | RobotStatus::Stuck
                     | RobotStatus::BeingTowed
                     | RobotStatus::Lost
+                    // A status this version does not know: not one to
+                    // command until it reads as something known.
+                    | RobotStatus::Unknown
             )
     }
 
@@ -241,6 +244,7 @@ mod tests {
             faults: vec![],
             in_relay_coverage: true,
             telemetry_t: 0.0,
+            tank_wh: None,
         }
     }
 

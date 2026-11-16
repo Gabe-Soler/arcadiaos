@@ -147,6 +147,16 @@ impl Energy {
         }
     }
 
+    /// Take in what mobile charger `c` reports of its own tank (protocol
+    /// 1.1): the simulator's figure replaces the running estimate.
+    pub fn observe_tank(&mut self, c: usize, wh: f64) {
+        if let Some(t) = self.tank_wh.get_mut(&c)
+            && wh.is_finite()
+        {
+            *t = wh.max(0.0);
+        }
+    }
+
     /// A charger topped up its tank at a station.
     pub fn refill(&mut self, reg: &Registry, c: usize) {
         if let Some(t) = self.tank_wh.get_mut(&c) {
@@ -375,6 +385,7 @@ mod tests {
             faults: vec![],
             in_relay_coverage: true,
             telemetry_t: 0.0,
+            tank_wh: None,
         }
     }
 

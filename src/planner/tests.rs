@@ -40,6 +40,7 @@ fn state(id: &str, x: u32, y: u32) -> RobotState {
         faults: vec![],
         in_relay_coverage: true,
         telemetry_t: 0.0,
+        tank_wh: None,
     }
 }
 
