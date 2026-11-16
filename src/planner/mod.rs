@@ -31,7 +31,7 @@ use arcadia_protocol::{
     CapabilityName, CellObservation, GridCoord, GridRect, LandingPadSpec, Surface,
 };
 use material::Material;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Cells and task keys that in-flight commands already cover.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -181,6 +181,8 @@ pub struct Recheck {
     pub wanted: bool,
     /// Recheck rounds completed.
     pub rounds: u32,
+    /// Scans made in the round in progress beyond its first.
+    pub passes: u32,
 }
 
 /// Height margin a berm check needs above the specified height, m.
@@ -1133,6 +1135,28 @@ impl Planner {
     /// loop keeps making progress.
     pub fn after_recheck(&mut self, world: &WorldModel, cfg: &Config) -> usize {
         self.recheck.wanted = false;
+        if self.careful {
+            // A cell no scan reaches must not keep the scout scanning.
+            let more_scans = self.recheck.passes < cfg.recheck_max_samples;
+            match self.measured_rework(world, more_scans, cfg) {
+                // Too close to call: scan the pad again before redoing
+                // anything.
+                None => {
+                    self.recheck.wanted = true;
+                    self.recheck.passes += 1;
+                    return 0;
+                }
+                Some(cells) => {
+                    self.recheck.rounds += 1;
+                    self.recheck.passes = 0;
+                    let n = cells.len();
+                    for c in cells {
+                        self.rework.insert((c.x, c.y));
+                    }
+                    return n + self.berm_topups(world, cfg, n == 0);
+                }
+            }
+        }
         self.recheck.rounds += 1;
         let round = f64::from(self.recheck.rounds.min(4));
         let target = self.pad.target_elevation_m;
@@ -1187,7 +1211,133 @@ impl Planner {
             self.rework.insert((c.x, c.y));
             actions += 1;
         }
-        // Berm cells whose measured height is doubtful get another load's worth.
+        actions + self.berm_topups(world, cfg, actions == 0)
+    }
+
+    /// The pad cells a careful crew redoes after a recheck scan, from the
+    /// averaged readings of every cell: `None` when another scan should come
+    /// first.
+    ///
+    /// The pad looked finished and the run goes on, so some cell is outside
+    /// the tolerance or some step between neighbours is over the slope
+    /// limit, hidden in the scatter of the scans. Each cell gets a score:
+    /// how far its averaged height, or its step to a neighbour, is past the
+    /// limit, in standard errors of that figure. A step is charged to the
+    /// cell of the pair that is farther from the target.
+    ///
+    /// - Cells more than `recheck_z` past a limit are redone, all at once.
+    /// - Otherwise, while a cell that is not clearly inside (by `measure_z`)
+    ///   has fewer than `recheck_max_samples` scans, the pad is scanned
+    ///   again: that takes minutes, and a cell redone takes hours. Each
+    ///   round that fails to finish the pad allows as many scans again.
+    /// - When scanning has nothing more to tell, the single cell with the
+    ///   highest score is redone.
+    fn measured_rework(
+        &self,
+        world: &WorldModel,
+        more_scans: bool,
+        cfg: &Config,
+    ) -> Option<Vec<GridCoord>> {
+        let target = self.pad.target_elevation_m;
+        let tol = self.pad.surface_tolerance_m;
+        let max_rise = self.pad.max_slope_deg.to_radians().tan() * world.site.cell_size_m;
+        // (averaged height, its standard error, scans behind it). A
+        // sintered cell is judged on the scans made since it was sintered:
+        // the ones before are the ones it was chosen by.
+        let read = |c: GridCoord| -> (f64, f64, u32) {
+            let unread = (target, f64::INFINITY, 0);
+            world.site.get(c).map_or(unread, |k| {
+                if k.surface == Surface::Stabilized {
+                    k.since_sintered(cfg.scan_noise_m).unwrap_or(unread)
+                } else {
+                    k.elevation()
+                        .map_or(unread, |e| (e, k.std_err(cfg.scan_noise_m), k.samples))
+                }
+            })
+        };
+        let score = |excess: f64, se: f64| {
+            if se.is_finite() && se > 0.0 {
+                excess / se
+            } else if excess > 0.0 {
+                f64::INFINITY
+            } else {
+                0.0
+            }
+        };
+        // Per cell: its worst score, and the fewest scans behind any figure
+        // that went into it.
+        let mut worst: BTreeMap<(u32, u32), (f64, u32)> = BTreeMap::new();
+        let mut charge = |c: GridCoord, s: f64, n: u32| {
+            let e = worst
+                .entry((c.x, c.y))
+                .or_insert((f64::NEG_INFINITY, u32::MAX));
+            if s > e.0 {
+                *e = (s, n);
+            }
+        };
+        for &c in &self.order {
+            let (e, se, n) = read(c);
+            charge(c, score((e - target).abs() - tol, se), n);
+            for nb in [
+                GridCoord { x: c.x + 1, y: c.y },
+                GridCoord { x: c.x, y: c.y + 1 },
+            ] {
+                if !self.in_pad(nb) {
+                    continue;
+                }
+                let (en, sen, nn) = read(nb);
+                let who = if (en - target).abs() > (e - target).abs() {
+                    nb
+                } else {
+                    c
+                };
+                let s = score((en - e).abs() - max_rise, (se * se + sen * sen).sqrt());
+                charge(who, s, n.min(nn));
+            }
+        }
+        let at = |&(x, y): &(u32, u32)| GridCoord { x, y };
+        let mut found: Vec<(f64, GridCoord)> = worst
+            .iter()
+            .filter(|(_, v)| v.0 > cfg.recheck_z)
+            .map(|(k, v)| (v.0, at(k)))
+            .collect();
+        if !found.is_empty() {
+            found.sort_by(|a, b| b.0.total_cmp(&a.0));
+            return Some(found.into_iter().map(|f| f.1).collect());
+        }
+        let cap = cfg
+            .recheck_max_samples
+            .saturating_mul(self.recheck.rounds + 1);
+        let open = worst.values().any(|v| v.0 > -cfg.measure_z && v.1 < cap);
+        if open && more_scans {
+            return None;
+        }
+        // Nothing stands out and more scans will not change that: the most
+        // likely cell, if any is in doubt at all.
+        Some(
+            worst
+                .iter()
+                .filter(|(_, v)| v.0 > -cfg.measure_z)
+                .max_by(|a, b| a.1.0.total_cmp(&b.1.0))
+                .map(|(k, _)| at(k))
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// Berm cells whose measured height is doubtful get another load's
+    /// worth; with `always`, so does the weakest one, so that a recheck
+    /// that found nothing else to do still does something.
+    fn berm_topups(&mut self, world: &WorldModel, cfg: &Config, always: bool) -> usize {
+        let target = self.pad.target_elevation_m;
+        let elev = |c: GridCoord| {
+            world
+                .site
+                .get(c)
+                .and_then(|k| k.elevation())
+                .unwrap_or(target)
+        };
+        let mut actions = 0;
         let height = self.pad.berm.as_ref().map_or(0.0, |b| b.height_m);
         let mut weakest: Option<(f64, usize)> = None;
         for (i, b) in self.berm.iter().enumerate() {
@@ -1206,7 +1356,7 @@ impl Planner {
                     .is_some_and(|base| elev(b.at) < base + height + 0.03)
             })
             .map(|(i, _)| i)
-            .chain(weakest.filter(|_| actions == 0).map(|w| w.1))
+            .chain(weakest.filter(|_| always).map(|w| w.1))
             .collect();
         for i in topups {
             let at = self.berm[i].at;

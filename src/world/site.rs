@@ -30,6 +30,9 @@ pub struct CellKnowledge {
     pub elevation_m: Option<f64>,
     /// Scans of this cell since its surface last moved.
     pub samples: u32,
+    /// How many of those scans were in hand when the cell was sintered, and
+    /// their mean, m. See [`CellKnowledge::since_sintered`].
+    chosen: (u32, f64),
     /// When work last moved the surface (dig, fill, grade, compact).
     pub moved_t: f64,
     /// Completion time of the latest scan of this cell.
@@ -54,6 +57,7 @@ impl Default for CellKnowledge {
             prior_elevation_m: None,
             elevation_m: None,
             samples: 0,
+            chosen: (0, 0.0),
             moved_t: f64::NEG_INFINITY,
             scanned_t: None,
             surface: Surface::Natural,
@@ -93,6 +97,23 @@ impl CellKnowledge {
         }
     }
 
+    /// The height from the scans made since the cell was sintered, m, its
+    /// standard error for scans of standard deviation `noise_m`, and how
+    /// many scans went into it: `None` before any such scan. For a cell
+    /// that has not been sintered, that is every scan since it last moved.
+    ///
+    /// A cell is sintered because its scans placed it inside the limits. A
+    /// cell near a limit is therefore sintered when its scans happened to
+    /// err towards the target, and their mean flatters it for good. The
+    /// scans made since were chosen by nothing.
+    pub fn since_sintered(&self, noise_m: f64) -> Option<(f64, f64, u32)> {
+        let (old, old_mean) = self.chosen;
+        let n = self.samples.checked_sub(old).filter(|&n| n > 0)?;
+        let mean = self.elevation_m?;
+        let fresh = (mean * f64::from(self.samples) - old_mean * f64::from(old)) / f64::from(n);
+        Some((fresh, noise_m / f64::from(n).sqrt(), n))
+    }
+
     /// The cell changed without its height changing (it was sintered).
     fn changed(&mut self, t: f64) {
         self.changed_t = t;
@@ -104,6 +125,7 @@ impl CellKnowledge {
         self.changed(t);
         self.moved_t = t;
         self.samples = 0;
+        self.chosen = (0, 0.0);
     }
 }
 
@@ -210,6 +232,7 @@ impl SiteKnowledge {
                         // A scan sent before the surface last moved may have
                         // read it either way: it counts as no sample.
                         k.samples = u32::from(k.moved_t <= issued_t);
+                        k.chosen = (0, 0.0);
                     }
                 }
             }
@@ -298,6 +321,7 @@ impl SiteKnowledge {
         if let Some(k) = self.get_mut(c) {
             k.surface = Surface::Stabilized;
             k.changed(t);
+            k.chosen = (k.samples, k.elevation_m.unwrap_or(0.0));
         }
     }
 
@@ -417,6 +441,42 @@ mod tests {
         assert!(!s.get(c).unwrap().verified());
         s.apply_scan(&[scan(c, -10.2, Surface::Stabilized, None)], 20.0, 40.0);
         assert!(s.get(c).unwrap().verified());
+    }
+
+    #[test]
+    fn a_sintered_cell_is_also_read_from_the_scans_made_since() {
+        let mut s = site();
+        let c = GridCoord { x: 1, y: 1 };
+        // Compacted, and scanned three times: 1 cm below where it is.
+        s.record_compact(c, 0.0, 1.0);
+        for (i, e) in [-10.02, -10.00, -10.01].into_iter().enumerate() {
+            let t = 2.0 + i as f64;
+            s.apply_scan(&[scan(c, e, Surface::Compacted, None)], t, t + 0.5);
+        }
+        let k = s.get(c).unwrap();
+        assert_eq!(k.samples, 3);
+        assert!((k.elevation().unwrap() + 10.01).abs() < 1e-12);
+        // Until it is sintered every scan counts; once it is, none does
+        // until it is scanned again.
+        assert_eq!(k.since_sintered(0.01).map(|r| r.2), Some(3));
+        s.record_sinter(c, 10.0);
+        assert_eq!(s.get(c).unwrap().since_sintered(0.01), None);
+        // Two scans since read it at its true height. The mean of all five
+        // still leans on the first three; the two since do not.
+        for (i, e) in [-9.99, -10.01].into_iter().enumerate() {
+            let t = 11.0 + i as f64;
+            s.apply_scan(&[scan(c, e, Surface::Stabilized, None)], t, t + 0.5);
+        }
+        let k = s.get(c).unwrap();
+        assert_eq!(k.samples, 5);
+        assert!((k.elevation().unwrap() + 10.006).abs() < 1e-12);
+        let (mean, se, n) = k.since_sintered(0.01).unwrap();
+        assert!((mean + 10.0).abs() < 1e-9, "{mean}");
+        assert!((se - 0.01 / 2f64.sqrt()).abs() < 1e-12);
+        assert_eq!(n, 2);
+        // Work that moves the surface starts everything again.
+        s.record_grade(c, -10.0, 20.0);
+        assert_eq!(s.get(c).unwrap().since_sintered(0.01), None);
     }
 
     #[test]

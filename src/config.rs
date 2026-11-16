@@ -70,6 +70,14 @@ pub struct Config {
     pub measure_z: f64,
     /// Scans of one cell after which its mean is taken as it stands.
     pub measure_max_samples: u32,
+    /// At the end of a build whose pad looks finished and is not, a careful
+    /// crew scans a cell up to this many times before it redoes one on
+    /// suspicion. A scan of the pad takes minutes; a cell redone takes
+    /// hours.
+    pub recheck_max_samples: u32,
+    /// How many standard errors past a limit a cell's averaged height has
+    /// to be for a careful crew to redo it without scanning again.
+    pub recheck_z: f64,
     /// Measured cells kept ready for the sinterers: with fewer waiting,
     /// compacted cells are scanned at once and not in batches.
     pub measure_ahead_cells: usize,
@@ -345,6 +353,8 @@ impl Default for Config {
             presinter_margin_m: 0.005,
             measure_z: 2.0,
             measure_max_samples: 16,
+            recheck_max_samples: 48,
+            recheck_z: 3.0,
             measure_ahead_cells: 8,
             careful_sinter_s: 900.0,
 

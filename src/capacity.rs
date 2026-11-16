@@ -65,6 +65,8 @@ pub struct CapacityPlan {
     pub energy_wh: Vec<f64>,
     /// Workload size when solved.
     pub solved_size: f64,
+    /// Capabilities that had work when solved.
+    solved_caps: Vec<CapabilityName>,
     /// Robots available when solved.
     pub solved_available: Vec<bool>,
     /// Whether the linear program solved (otherwise shares are an even split).
@@ -212,6 +214,11 @@ impl CapacityPlan {
             loads_s: vec![0.0; n_robots],
             energy_wh: vec![0.0; n_robots],
             solved_size: workload_size(workload),
+            solved_caps: workload
+                .iter()
+                .filter(|(_, w)| w.steps > 0.0)
+                .map(|(&cap, _)| cap)
+                .collect(),
             solved_available: (0..n_robots).map(usable).collect(),
             ..Self::default()
         };
@@ -308,7 +315,15 @@ impl CapacityPlan {
             .shares
             .keys()
             .any(|(_, cap)| workload.get(cap).is_none_or(|w| w.steps <= 0.0));
-        drained || ended
+        // And when work appears that the plan knows nothing of: a
+        // capability that had none, or a workload grown past the one solved
+        // for. Rework found at the end of a build is such work, and a plan
+        // solved for an empty pad gives nobody the role to do it.
+        let appeared = workload
+            .iter()
+            .any(|(cap, w)| w.steps > 0.0 && !self.solved_caps.contains(cap));
+        let grown = size > 1.15 * self.solved_size;
+        drained || ended || appeared || grown
     }
 }
 
@@ -325,6 +340,33 @@ mod tests {
             travel_m_per_step: 1.0,
             passes,
         }
+    }
+
+    #[test]
+    fn work_that_appears_makes_the_plan_stale() {
+        let sinterer = |id: &str| robot(id, 0.1, vec![cap(Sinter, 4e-5, 37_000.0, None)]);
+        let reg = Registry::new(&scenario(vec![sinterer("cp-1"), sinterer("cp-2")]));
+        let cfg = Config::default();
+        let crew = [true, true];
+        // A plan solved for a finished pad: nobody has a role.
+        let done = CapacityPlan::solve(&Workload::new(), &reg, &crew, &cfg);
+        assert!(!done.has_roles(0, 0.01) && !done.has_roles(1, 0.01));
+        assert!(!done.stale(&Workload::new(), &crew));
+        // The recheck finds four cells to redo: that is work the plan knows
+        // nothing of, and solving again hands out the sintering.
+        let mut redo = Workload::new();
+        redo.insert(Sinter, work(4.0, 4.0, 1.0));
+        assert!(done.stale(&redo, &crew));
+        let plan = CapacityPlan::solve(&redo, &reg, &crew, &cfg);
+        assert!(plan.is_role(0, Sinter, 0.01) && plan.is_role(1, Sinter, 0.01));
+        assert!(!plan.stale(&redo, &crew));
+        // More of the same work, well past what was planned, does it too;
+        // a little more does not.
+        let mut more = Workload::new();
+        more.insert(Sinter, work(4.5, 4.5, 1.0));
+        assert!(!plan.stale(&more, &crew));
+        more.insert(Sinter, work(6.0, 6.0, 1.0));
+        assert!(plan.stale(&more, &crew));
     }
 
     #[test]

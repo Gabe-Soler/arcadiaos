@@ -820,10 +820,17 @@ impl State {
             Stage::Recheck => {
                 let actions = planner.after_recheck(&self.world, cfg);
                 diag.info(t, || {
-                    format!(
-                        "recheck round {}: {actions} corrective actions",
-                        planner.recheck.rounds
-                    )
+                    if planner.recheck.wanted {
+                        format!(
+                            "recheck: too close to call after {} scans; scanning again",
+                            planner.recheck.passes
+                        )
+                    } else {
+                        format!(
+                            "recheck round {}: {actions} corrective actions",
+                            planner.recheck.rounds
+                        )
+                    }
                 });
             }
             Stage::Survey | Stage::Verify | Stage::BermCheck => {}

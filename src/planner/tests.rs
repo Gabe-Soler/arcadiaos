@@ -523,6 +523,118 @@ fn recheck_always_finds_something_to_fix() {
     assert_eq!(p.rework_cells(), 0);
 }
 
+/// A careful crew's pad, finished as far as its scans showed when each
+/// cell was sintered: every cell read `TARGET` three times while compacted,
+/// except `flattered`, whose three readings were `before` above the target.
+/// Then `scans` scans of the finished pad, in which `flattered` reads
+/// `since` above the target.
+fn finished_pad(
+    w: &mut WorldModel,
+    p: &Planner,
+    flattered: GridCoord,
+    (before, since): (f64, f64),
+    scans: u32,
+) {
+    let cells: Vec<(GridCoord, f64)> = p
+        .order()
+        .iter()
+        .map(|&c| (c, if c == flattered { before } else { 0.0 }))
+        .collect();
+    compacted(w, &cells, 3);
+    for &(c, _) in &cells {
+        w.site.record_sinter(c, 10.0);
+    }
+    rescan(w, p, flattered, since, scans, 0);
+}
+
+/// `scans` more scans of the finished pad, the first of them number `from`.
+fn rescan(w: &mut WorldModel, p: &Planner, odd: GridCoord, above: f64, scans: u32, from: u32) {
+    for i in from..from + scans {
+        let obs: Vec<CellObservation> = p
+            .order()
+            .iter()
+            .map(|&c| {
+                let e = TARGET + if c == odd { above } else { 0.0 };
+                observe(c, e, Surface::Stabilized, false)
+            })
+            .collect();
+        let t = 20.0 + f64::from(i);
+        w.site.apply_scan(&obs, t, t + 0.5);
+    }
+}
+
+#[test]
+fn a_careful_crew_scans_again_before_it_redoes_a_sintered_cell() {
+    let cfg = Config::default();
+    let (mut w, reg) = careful_world();
+    let mut p = Planner::new("g", &pad_spec(vec![]), &w, &reg, &cfg);
+    let odd = GridCoord { x: 3, y: 3 };
+    // One cell stands 3.6 cm above its neighbours, a millimetre over the
+    // 3.49 cm a 2 degree slope allows. The scans it was sintered on showed
+    // 2.5 cm, and with them the pad looks finished.
+    finished_pad(&mut w, &p, odd, (0.025, 0.036), 1);
+    assert!(p.progress(&w, &cfg).complete());
+    // One scan since: a millimetre over is far inside its scatter, and no
+    // cell has been scanned often enough to be cleared. Scan again.
+    assert_eq!(p.after_recheck(&w, &cfg), 0);
+    assert!(p.recheck.wanted);
+    assert_eq!(
+        (p.recheck.rounds, p.recheck.passes, p.rework_cells()),
+        (0, 1, 0)
+    );
+    // After 48 scans the step is still too close to call, and scanning has
+    // told what it can: the one cell in doubt is redone, and only that one.
+    rescan(&mut w, &p, odd, 0.036, 46, 1);
+    assert_eq!(p.after_recheck(&w, &cfg), 0);
+    rescan(&mut w, &p, odd, 0.036, 1, 47);
+    assert_eq!(p.after_recheck(&w, &cfg), 1);
+    assert!(!p.recheck.wanted);
+    assert_eq!(
+        (p.recheck.rounds, p.recheck.passes, p.rework_cells()),
+        (1, 0, 1)
+    );
+    assert!(p.cell_status(&w, odd, &cfg).grade);
+}
+
+#[test]
+fn a_cell_clearly_out_is_redone_without_more_scans() {
+    let cfg = Config::default();
+    let (mut w, reg) = careful_world();
+    let mut p = Planner::new("g", &pad_spec(vec![]), &w, &reg, &cfg);
+    let odd = GridCoord { x: 4, y: 2 };
+    // 4.6 cm above its neighbours in each of four scans since it was
+    // sintered: 1.1 cm over the limit, where the step's standard error is
+    // 0.7 cm. That is not three standard errors, so the pad is scanned
+    // again; after sixteen scans it is, and the cell is redone at once.
+    finished_pad(&mut w, &p, odd, (0.02, 0.046), 4);
+    assert_eq!(p.after_recheck(&w, &cfg), 0);
+    assert!(p.recheck.wanted);
+    rescan(&mut w, &p, odd, 0.046, 12, 4);
+    assert_eq!(p.after_recheck(&w, &cfg), 1);
+    assert_eq!(p.rework_cells(), 1);
+    assert!(p.cell_status(&w, odd, &cfg).grade);
+}
+
+#[test]
+fn a_cell_no_scan_reaches_does_not_keep_the_scout_scanning() {
+    let cfg = Config {
+        recheck_max_samples: 3,
+        ..Config::default()
+    };
+    let (mut w, reg) = careful_world();
+    let mut p = Planner::new("g", &pad_spec(vec![]), &w, &reg, &cfg);
+    // A finished pad never scanned since: no cell can be cleared.
+    finished_pad(&mut w, &p, GridCoord { x: 3, y: 3 }, (0.0, 0.0), 0);
+    for pass in 1..=3 {
+        assert_eq!(p.after_recheck(&w, &cfg), 0);
+        assert_eq!(p.recheck.passes, pass);
+    }
+    // The fourth recheck stops asking for scans and ends the round.
+    p.after_recheck(&w, &cfg);
+    assert!(!p.recheck.wanted);
+    assert_eq!((p.recheck.rounds, p.recheck.passes), (1, 0));
+}
+
 #[test]
 fn workload_counts_remaining_stages() {
     let cfg = Config::default();
