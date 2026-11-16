@@ -20,7 +20,8 @@
 //! stands. So a crew also keeps a robot for each of those, when the
 //! scenario's designs offer one: measured on ArcadiaBench, the crew this
 //! model liked best without that rule had no hauler, was the quickest when
-//! it finished, and finished 27 runs of 60.
+//! it finished, and finished 27 runs of 60. Its only excavator ran flat,
+//! and it was also the only robot that could have towed another.
 //!
 //! Nothing here is specific to a benchmark: the designs are whatever robots
 //! the scenario lists, grouped by model.

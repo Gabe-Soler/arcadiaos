@@ -449,7 +449,7 @@ ArcadiaBench 1.1's default catalog makes the build take weeks: seven hours and 3
 3. **Charge for outages.** Each robot is taken to be out for `design_outage_frac`, 1%, of the build, and its absence costs the build time of the crew without it, at most twice the crew's own. A crew whose only scout is out stands still; one with a second scout does not. This is worked out for the 200 quickest crews.
 4. **Choose.** Among the crews within 0.5% of the least expected time, the lightest.
 
-**Support roles.** The pad's work is not all a crew is for: a robot that fails has to be repaired, and one that runs flat in the field has to be charged where it stands. A crew keeps a robot for each of those when the designs offer one. Without this rule the model's favourite on ArcadiaBench had no hauler. It was the quickest crew when it finished, and it finished 27 runs of 60. In the run looked at, its only excavator ran flat after towing a sinterer to the depot, nothing could charge it where it stood, and it stayed offline for the other 99 sols.
+**Support roles.** The pad's work is not all a crew is for: a robot that fails has to be repaired, and one that runs flat in the field has to be charged where it stands. A crew keeps a robot for each of those when the designs offer one. Without this rule the model's favourite on ArcadiaBench had no hauler. It was the quickest crew when it finished, and it finished 27 runs of 60. In the run looked at, its only excavator sat for three hours below its reserve without being sent to charge, and ran flat. Nothing could charge it where it stood, and nothing could tow it: only a robot that hauls can tow, and it was the only one. It stayed offline for the other 99 sols.
 
 **On ArcadiaBench's catalog 1.1** (budget 10 t; masses 90, 420, 300 and 900 kg) the plant feeds nine to ten compactor-sinterers, so the designer sends ten and spends what is left on two scouts, an excavator and a hauler. Measured over all six variants, seeds 1–10:
 
@@ -464,7 +464,7 @@ ArcadiaBench 1.1's default catalog makes the build take weeks: seven hours and 3
 
 The headline here is against the track's one reference for every crew, so a crew with few sinterers scores low. The designer's neighbours with one or three scouts score the same within 0.001.
 
-**What it does not know.** It designs for the one scenario it is given, so a crew for the nominal plant is not the best for `nuclear_heavy`, where power is plentiful and an eleventh sinterer would pay. And the last row shows a limit of ArcadiaOS, not only of the crew: with no mobile charger in the crew, a robot that ran flat was left where it stood. Recovering it by a tow to a station is work still to do.
+**What it does not know.** It designs for the one scenario it is given, so a crew for the nominal plant is not the best for `nuclear_heavy`, where power is plentiful and an eleventh sinterer would pay. And the last row shows a limit of ArcadiaOS as well as of the crew. The crew had one robot that nothing could recover. ArcadiaOS let that robot run flat: it was low on charge, 27 m from a station, and was not sent there in time. Why it was not is still to be found; with a mobile charger in the crew the same seeds all finish.
 
 ## Extension points
 
