@@ -68,6 +68,9 @@ pub struct CommsStatus {
     pub window_end_t: Option<f64>,
 }
 
+/// Weight of each new gap between passes in the running mean.
+const PASS_GAP_WEIGHT: f64 = 0.2;
+
 /// Everything ArcadiaOS believes about the world.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorldModel {
@@ -97,6 +100,10 @@ pub struct WorldModel {
     pub weather: Option<WeatherStatus>,
     /// Latest comms report.
     pub comms: Option<CommsStatus>,
+    /// How long the Earth link has stayed down between passes, on average
+    /// over the gaps seen so far, s. `None` on a link that has shown none:
+    /// one that does not work in pass windows.
+    pub pass_gap_s: Option<f64>,
 }
 
 impl WorldModel {
@@ -116,6 +123,7 @@ impl WorldModel {
             power: None,
             weather: None,
             comms: None,
+            pass_gap_s: None,
         }
     }
 
@@ -159,6 +167,19 @@ impl WorldModel {
                 expected_restore_t,
                 window_end_t,
             } => {
+                // A gap between passes, and when the next pass is due: the
+                // length of such gaps is what an answer from Earth may have
+                // to wait on top of everything else.
+                if *link == Link::Down
+                    && *cause == CommsCause::BetweenPasses
+                    && let Some(back) = expected_restore_t.filter(|&b| b > e.t)
+                {
+                    let gap = back - e.t;
+                    self.pass_gap_s = Some(match self.pass_gap_s {
+                        Some(mean) => mean + PASS_GAP_WEIGHT * (gap - mean),
+                        None => gap,
+                    });
+                }
                 self.comms = Some(CommsStatus {
                     t: e.t,
                     link: *link,
@@ -264,6 +285,8 @@ mod tests {
             (down.window_end_t, down.expected_restore_t),
             (None, Some(4000.0))
         );
+        // The gap to the next pass is remembered: 4000 - 5 s here.
+        assert_eq!(w.pass_gap_s, Some(3995.0));
         w.observe(&event(EventKind::Comms {
             link: Link::Down,
             cause: CommsCause::Outage,

@@ -1254,7 +1254,7 @@ impl State {
         }
         if self
             .authority
-            .status_due(now, self.world.link_up(), cfg.status_period_s)
+            .status_due(now, self.world.link_up(), self.status_period_s(cfg))
         {
             let (summary, progress) = self.status(cfg);
             diag.info(now, || format!("status report: {summary}"));
@@ -1543,11 +1543,17 @@ impl State {
             return false;
         }
         let weight = self.capacity.utilization(x).clamp(0.2, 1.0);
-        let alt_s = alt.map_or(cfg.no_alternative_s, |p| p.cost_s);
+        // A robot is worth the work it would still do: its share of what
+        // is left of the build. With nothing else to bring `x` back, that
+        // is what cannibalizing gains; and it is what stripping the donor
+        // risks, if Earth would rather have kept it.
+        let left_s = self.capacity.makespan_s.max(0.0);
+        let alt_s = alt.map_or(cfg.no_alternative_s.max(left_s), |p| p.cost_s);
+        let donor_worth_s = self.capacity.utilization(donor) * left_s;
         let stakes = Stakes {
             benefit_s: (alt_s - c.cost_s).max(0.0) * weight,
             wait_cost_per_s: weight,
-            risk_s: cfg.cannibalize_risk_s,
+            risk_s: cfg.cannibalize_risk_s.max(donor_worth_s),
         };
         let max_wait = self.world.policy.level3.max_wait_s;
         let reach = self.reach(cfg);
@@ -1601,13 +1607,30 @@ impl State {
     /// How fast Earth can answer now: a round trip at the reported delay plus
     /// mission control's typical response time.
     fn reach(&self, cfg: &Config) -> Reach {
+        let now = self.world.now;
         let d = self.world.one_way_delay_s(cfg.assumed_delay_s);
-        let answer_s = 2.0 * d + cfg.earth_response_s;
+        let mut answer_s = 2.0 * d + cfg.earth_response_s;
+        let comms = self.world.comms.as_ref();
+        // On a link that works in pass windows the answer also has to find
+        // a pass. If it is not back before the window in progress closes,
+        // it waits out a gap: the whole of the next one when it would have
+        // come within that gap, about half of one otherwise.
+        if let Some(gap) = self.world.pass_gap_s {
+            let open_for = comms
+                .filter(|c| c.link == arcadia_protocol::Link::Up)
+                .and_then(|c| c.window_end_t)
+                .map(|end| (end - now).max(0.0));
+            answer_s = match open_for {
+                Some(open) if answer_s <= open => answer_s,
+                Some(open) if answer_s <= open + gap => open + gap,
+                _ => answer_s + 0.5 * gap,
+            };
+        }
         if self.world.link_up() {
             Reach::Up { answer_s }
         } else {
             Reach::Down {
-                back_t: self.world.comms.as_ref().and_then(|c| c.expected_restore_t),
+                back_t: comms.and_then(|c| c.expected_restore_t),
                 answer_s,
             }
         }
@@ -2622,6 +2645,18 @@ impl State {
         }
     }
 
+    /// How often Earth gets a status report while the link is up, s: the
+    /// configured period, which is a sol on Mars, kept to the scenario's
+    /// own sol where that differs.
+    fn status_period_s(&self, cfg: &Config) -> f64 {
+        let sol = self.world.sol_length_s;
+        if sol > 0.0 && (cfg.status_period_s - 88_775.0).abs() < 1.0 {
+            sol
+        } else {
+            cfg.status_period_s
+        }
+    }
+
     /// How long idle robots can be left unlooked at, s. Whatever happens to
     /// the crew arrives as an event and wakes ArcadiaOS by itself; the one
     /// thing that does not is an idle robot's battery running down. So the
@@ -3444,6 +3479,152 @@ mod tests {
                 window_end_t: None,
             },
         }
+    }
+
+    /// A `comms` report at `t` on a link that works in pass windows.
+    fn pass(t: f64, link: Link, restore: Option<f64>, window_end: Option<f64>) -> Event {
+        Event {
+            t,
+            kind: EventKind::Comms {
+                link,
+                cause: if link == Link::Up {
+                    CommsCause::Nominal
+                } else {
+                    CommsCause::BetweenPasses
+                },
+                one_way_delay_s: 600.0,
+                expected_restore_t: restore,
+                window_end_t: window_end,
+            },
+        }
+    }
+
+    #[test]
+    fn an_answer_from_earth_has_to_find_a_pass() {
+        let mut os = Coordinator::with_config(Config::default(), Diag::new(Level::Off));
+        let mut told = hello();
+        told.scenario.constants = Some(crate::config::tests::sent());
+        os.start(told);
+        let cfg = os.cfg.clone();
+        let robots = || vec![state("scout", 1, 1), state("worker", 1, 2)];
+        let mut seq = 0;
+        let mut observe = |os: &mut Coordinator, t: f64, events: Vec<Event>| {
+            os.decide(&Observation {
+                seq,
+                t,
+                events,
+                robots: robots(),
+            });
+            seq += 1;
+        };
+        let reach = |os: &Coordinator| os.state.as_ref().unwrap().reach(&cfg);
+        // Light there and back, and the four hours the simulator says Earth
+        // takes: with a link that has shown no pass windows, that is all.
+        let plain = 2.0 * 600.0 + 14_400.0;
+        observe(&mut os, 0.0, vec![comms(Link::Up, CommsCause::Nominal)]);
+        assert_eq!(
+            reach(&os),
+            Reach::Up {
+                answer_s: 2.0 * 720.0 + 14_400.0
+            }
+        );
+        // A window closes and the next pass is five hours off: gaps are
+        // five hours long, as far as this link has shown.
+        let gap = 18_000.0;
+        observe(
+            &mut os,
+            100.0,
+            vec![pass(100.0, Link::Down, Some(100.0 + gap), None)],
+        );
+        assert_eq!(
+            reach(&os),
+            Reach::Down {
+                back_t: Some(100.0 + gap),
+                answer_s: plain + 0.5 * gap
+            }
+        );
+        // A ten-minute relay pass: the answer cannot be back before it
+        // closes. It is ready during the gap that follows, so it arrives
+        // when the next pass opens.
+        let t = 100.0 + gap;
+        observe(&mut os, t, vec![pass(t, Link::Up, None, Some(t + 600.0))]);
+        assert_eq!(
+            reach(&os),
+            Reach::Up {
+                answer_s: 600.0 + gap
+            }
+        );
+        // An Earth that takes longer than a pass and a gap together: where
+        // its answer falls among the passes is anyone's guess, and it waits
+        // about half a gap for one.
+        let slow = Config {
+            earth_response_s: 30_000.0,
+            ..cfg.clone()
+        };
+        let st = os.state.as_ref().unwrap();
+        assert_eq!(
+            st.reach(&slow),
+            Reach::Up {
+                answer_s: 1200.0 + 30_000.0 + 0.5 * gap
+            }
+        );
+        // A long window that outlasts the answer adds nothing.
+        let t = t + 1000.0;
+        observe(
+            &mut os,
+            t,
+            vec![pass(t, Link::Up, None, Some(t + 30_000.0))],
+        );
+        assert_eq!(reach(&os), Reach::Up { answer_s: plain });
+    }
+
+    #[test]
+    fn idle_robots_are_looked_at_when_their_batteries_call_for_it() {
+        let mut os = Coordinator::with_config(Config::default(), Diag::new(Level::Off));
+        os.start(hello());
+        let cfg = os.cfg.clone();
+        os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal()],
+            robots: vec![state("scout", 1, 1), state("worker", 1, 2)],
+        });
+        let st = os.state.as_ref().unwrap();
+        // Commands are in flight after the first decision. A robot with a
+        // full battery can be left for the longest wait...
+        assert!(!st.exec.idle());
+        assert_eq!(st.idle_wait_s(&[1], false, &cfg), cfg.idle_wake_max_s);
+        // ...one waiting to be recovered cannot...
+        assert_eq!(st.idle_wait_s(&[1], true, &cfg), cfg.idle_wake_s);
+        // ...and nor can one whose battery is nearly down to what parking
+        // needs: it is looked at again at the short interval.
+        let pos = GridCoord { x: 1, y: 2 };
+        let need = st.park_need_wh(1, pos, &cfg);
+        let mut low = state("worker", 1, 2);
+        low.battery_wh = need + 1.0;
+        let mut os2 = Coordinator::with_config(Config::default(), Diag::new(Level::Off));
+        os2.start(hello());
+        os2.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal()],
+            robots: vec![state("scout", 1, 1), low],
+        });
+        let st2 = os2.state.as_ref().unwrap();
+        assert_eq!(st2.idle_wait_s(&[1], false, &cfg), cfg.idle_wake_s);
+        // In between, the wait is half the time the spare charge lasts at
+        // the idle draw with the heater on.
+        let wait = st.idle_wait_s(
+            &[1],
+            false,
+            &Config {
+                idle_wake_max_s: 1e9,
+                ..cfg.clone()
+            },
+        );
+        let draw_w = st.reg.idle_wh(1, 3600.0) * (1.0 + cfg.heater_idle_factor);
+        let spare = 5000.0 - need;
+        assert!((wait - 0.5 * spare / draw_w * 3600.0).abs() < 1.0, "{wait}");
     }
 
     fn earth(t: f64, body: Uplink) -> Event {
