@@ -184,6 +184,15 @@ impl PowerModel {
         }
     }
 
+    /// What the plant can put into robots over a whole sol, W: fission and
+    /// the sol's mean of the sun at the dust last measured (the clear-sky
+    /// curve is half a sine over half the sol, so its mean is the peak over
+    /// pi), less the site's essential load.
+    pub fn mean_spare_w(&self) -> f64 {
+        let sun = self.system.solar_peak_w.max(0.0) * self.transmittance / std::f64::consts::PI;
+        (self.system.fission_w.max(0.0) + sun - self.system.essential_load_w.max(0.0)).max(0.0)
+    }
+
     /// Expected supply at `t`, W.
     pub fn supply_w(&self, t: f64) -> f64 {
         self.system.fission_w.max(0.0) + self.clear_sky_w(t) * self.transmittance
@@ -402,6 +411,32 @@ mod tests {
         let w = world_with_power(0.5 * SOL_S, 80_000.0, 150_000.0, 9_000.0);
         m.observe(&w, &Config::default());
         assert!((m.supply_w(0.5 * SOL_S) - 9_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn the_plant_has_a_sols_mean_to_spare_for_the_crew() {
+        // 10 kW of fission, a 20 kW sun whose mean over the sol is the peak
+        // over pi, and 2 kW the site keeps for itself.
+        let m = model(PowerMode::Hybrid, 10_000.0, 20_000.0, 100_000.0);
+        let sun = 20_000.0 / std::f64::consts::PI;
+        assert!((m.mean_spare_w() - (10_000.0 + sun - 2_000.0)).abs() < 1e-6);
+        // It is the mean of the forecast over a sol.
+        let n = 10_000;
+        let mean: f64 = (0..n)
+            .map(|i| m.supply_w(SOL_S * (f64::from(i) + 0.5) / f64::from(n)))
+            .sum::<f64>()
+            / f64::from(n);
+        assert!((mean - 2_000.0 - m.mean_spare_w()).abs() < 1.0, "{mean}");
+        // Dust takes its share of the sun, and a plant with nothing to
+        // spare has nothing, not less.
+        let mut dusty = model(PowerMode::SolarOnly, 0.0, 30_000.0, 150_000.0);
+        dusty.observe(
+            &world_with_power(0.5 * SOL_S, 80_000.0, 150_000.0, 9_000.0),
+            &Config::default(),
+        );
+        assert!((dusty.mean_spare_w() - (9_000.0 / std::f64::consts::PI - 2_000.0)).abs() < 1.0);
+        let none = model(PowerMode::SolarOnly, 0.0, 3_000.0, 150_000.0);
+        assert_eq!(none.mean_spare_w(), 0.0);
     }
 
     #[test]

@@ -300,7 +300,9 @@ fn hauls_use_payload_on_board_and_respect_overfill() {
         vec![state("hl", 4, 3, 5000.0, 380.0)],
         Config::default(),
     );
-    f.survey(-0.3);
+    // Fill aims a little under the grade level, which is the target plus
+    // the centimetre compaction will take off: 0.25 m of fill here.
+    f.survey(-0.29);
     f.plan_capacity();
     let tasks = f.planner.tasks(&f.world, &Busy::default(), &f.cfg);
     let fill = tasks.iter().find(|t| t.stage == Stage::Fill).unwrap();

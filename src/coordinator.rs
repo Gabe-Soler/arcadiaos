@@ -660,12 +660,14 @@ impl State {
                 a.planned.energy_factor.max(1e-9),
                 a.planned.duration_factor.max(1e-9),
             );
+            let tool_work = matches!(&a.job, Job::Work { task, .. } if crate::health::is_tool_work(task.capability()));
             self.health.calibrate(
                 r,
                 plan.energy_wh / fe,
                 *energy_used_wh,
                 plan.duration_s / fd,
                 t - a.issued_t,
+                tool_work,
             );
         }
         // Refused again and again, for whatever reason: give the robot a rest.
@@ -716,7 +718,7 @@ impl State {
             }
             Job::Repair { target, .. } => {
                 if done {
-                    self.health.repaired(target, cfg);
+                    self.health.repaired(&self.world, target, cfg);
                     self.capacity_dirty = true;
                 } else if !cancelled {
                     self.exec.back_off_robot(r, t + RECOVERY_BACKOFF_S);
@@ -818,10 +820,17 @@ impl State {
             Stage::Recheck => {
                 let actions = planner.after_recheck(&self.world, cfg);
                 diag.info(t, || {
-                    format!(
-                        "recheck round {}: {actions} corrective actions",
-                        planner.recheck.rounds
-                    )
+                    if planner.recheck.wanted {
+                        format!(
+                            "recheck: too close to call after {} scans; scanning again",
+                            planner.recheck.passes
+                        )
+                    } else {
+                        format!(
+                            "recheck round {}: {actions} corrective actions",
+                            planner.recheck.rounds
+                        )
+                    }
                 });
             }
             Stage::Survey | Stage::Verify | Stage::BermCheck => {}
@@ -939,9 +948,12 @@ impl State {
             && self.replan_allowed(&available, cfg, diag)
         {
             self.capacity = CapacityPlan::solve(&workload, &self.reg, &available, cfg);
+            self.capacity.bound_by_power(self.deliverable_w());
             self.capacity_dirty = false;
             diag.info(now, || describe_capacity(&self.capacity, &self.reg));
         }
+        // The dust moves between solves, and with it what the plant delivers.
+        self.capacity.bound_by_power(self.deliverable_w());
         self.release_chargers(cfg);
 
         let mut round = self.round(workload, now);
@@ -963,10 +975,10 @@ impl State {
         self.report(&mut round, cfg, diag);
 
         let mut wake = next_cooldown.filter(|&w| w > now);
-        let waiting =
-            !round.free.is_empty() || (0..n).any(|r| self.world.fleet.get(r).recoverable());
+        let recoverable = (0..n).any(|r| self.world.fleet.get(r).recoverable());
+        let waiting = !round.free.is_empty() || recoverable;
         if (self.exec.idle() || waiting) && !progress.complete() {
-            let idle_wake = now + cfg.idle_wake_s;
+            let idle_wake = now + self.idle_wait_s(&round.free, recoverable, cfg);
             wake = Some(wake.map_or(idle_wake, |w| w.min(idle_wake)));
         }
         // Look again when Earth's answer is due, or at once after asking
@@ -1252,7 +1264,7 @@ impl State {
         }
         if self
             .authority
-            .status_due(now, self.world.link_up(), cfg.status_period_s)
+            .status_due(now, self.world.link_up(), self.status_period_s(cfg))
         {
             let (summary, progress) = self.status(cfg);
             diag.info(now, || format!("status report: {summary}"));
@@ -1426,6 +1438,10 @@ impl State {
     fn recover(&mut self, round: &mut Round, cfg: &Config, diag: &Diag) {
         let now = round.now;
         let n = self.reg.len();
+        // A robot that came back another way needs no parts: the strip asked
+        // for it is forgotten, and its donor is a robot to recover again.
+        let fleet = &self.world.fleet;
+        self.strips.retain(|&(_, t)| fleet.get(t).recoverable());
         let mut targets: Vec<(bool, usize)> = (0..n)
             .filter(|&r| self.world.fleet.get(r).recoverable())
             .filter(|&r| self.in_contact(r))
@@ -1458,12 +1474,13 @@ impl State {
             let depot_wait = |d: usize, t: f64| round.depot_wait(d, capacity, t);
             let blocked = &round.blocked;
             let may = |action: &str| !blocked.contains(action);
-            let (authority, reg) = (&self.authority, &self.reg);
+            let (authority, reg, strips) = (&self.authority, &self.reg, &self.strips);
             let may_strip = |d: usize| {
                 strip_level <= 2
-                    || authority
-                        .authorization("cannibalize", &strip_purpose(reg, d, x), now)
-                        .is_some()
+                    || (strips.contains(&(d, x))
+                        && authority
+                            .authorization("cannibalize", &strip_purpose(reg, d, x), now)
+                            .is_some())
             };
             let (plan, ask) = {
                 let ctx = recovery::Ctx {
@@ -1485,12 +1502,44 @@ impl State {
                     .then(|| recovery::best_cannibalize(&ctx, x, &helpers))
                     .flatten()
                     .filter(|c| plan.as_ref().is_none_or(|p| c.cost_s < p.cost_s));
+                // Parts are weighed against the slow way back, which may
+                // need hands that are busy at this moment: what the crew
+                // could do for `x`, and for the donor if it is down itself,
+                // with every working robot free to help.
+                let ask = ask.map(|c| {
+                    let nobody = BTreeSet::new();
+                    let later = recovery::Ctx {
+                        engaged: &nobody,
+                        running: &nobody,
+                        ..ctx
+                    };
+                    let hands = |not: usize| -> Vec<usize> {
+                        (0..n)
+                            .filter(|&h| h != not && self.world.fleet.get(h).operable())
+                            .collect()
+                    };
+                    let slow = plan
+                        .clone()
+                        .or_else(|| recovery::plan(&later, x, &hands(x)));
+                    let donor_returns = match c.step {
+                        recovery::Step::Cannibalize { donor, .. } => {
+                            self.world.fleet.get(donor).operable()
+                                || recovery::plan(&later, donor, &hands(donor)).is_some()
+                        }
+                        _ => false,
+                    };
+                    Parts {
+                        strip: c,
+                        slow,
+                        donor_returns,
+                    }
+                });
                 (plan, ask)
             };
             // Parts from a donor would beat everything allowed: ask Earth, or
             // wait for its answer, unless the level-3 rule says not to bother.
-            if let Some(c) = ask
-                && self.weigh_cannibalize(x, plan.as_ref(), &c, cfg, diag)
+            if let Some(parts) = ask
+                && self.weigh_cannibalize(x, &parts, &round.workload, cfg, diag)
             {
                 continue;
             }
@@ -1519,11 +1568,12 @@ impl State {
     fn weigh_cannibalize(
         &mut self,
         x: usize,
-        alt: Option<&recovery::Plan>,
-        c: &recovery::Plan,
+        parts: &Parts,
+        workload: &Workload,
         cfg: &Config,
         diag: &Diag,
     ) -> bool {
+        let (c, alt, donor_returns) = (&parts.strip, parts.slow.as_ref(), parts.donor_returns);
         let now = self.world.now;
         let recovery::Step::Cannibalize { donor, .. } = c.step else {
             return false;
@@ -1536,20 +1586,59 @@ impl State {
         if self.strip_live(|_, t| t == donor) {
             return false;
         }
-        // Answered, or lapsed: what is allowed now stands.
-        if self.authority.asked("cannibalize", &purpose) {
-            return false;
-        }
-        let weight = self.capacity.utilization(x).clamp(0.2, 1.0);
-        let alt_s = alt.map_or(cfg.no_alternative_s, |p| p.cost_s);
+        // A robot is worth the time the build would lose without it. The
+        // rest of the build is planned four ways: with the crew as it is
+        // (`x` down), with `x` back as well, with `x` in the donor's place,
+        // and with both gone. A donor that is down but has its own way
+        // back counts as a robot the crew has.
+        let n = self.reg.len();
+        let crew = |back: Option<usize>, gone: Option<usize>| -> Vec<bool> {
+            (0..n)
+                .map(|r| {
+                    Some(r) != gone
+                        && (Some(r) == back
+                            || (r == donor && donor_returns)
+                            || (r != x && self.world.fleet.get(r).operable()))
+                })
+                .collect()
+        };
+        let without_s = self.build_time_s(workload, &crew(None, None), cfg);
+        let both_s = self.build_time_s(workload, &crew(Some(x), None), cfg);
+        let swapped_s = self.build_time_s(workload, &crew(Some(x), Some(donor)), cfg);
+        let stripped_s = self.build_time_s(workload, &crew(None, Some(donor)), cfg);
+        // What a second without `x` costs the build.
+        let rate = if without_s > 0.0 {
+            ((without_s - both_s) / without_s).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // Without the parts: `x` comes back the slow way, or not at all.
+        let otherwise_s = alt.map_or(without_s, |p| both_s + p.cost_s * rate);
+        let alt_s = alt.map_or(without_s, |p| p.cost_s);
         let stakes = Stakes {
-            benefit_s: (alt_s - c.cost_s).max(0.0) * weight,
-            wait_cost_per_s: weight,
-            risk_s: cfg.cannibalize_risk_s,
+            benefit_s: (otherwise_s - (swapped_s + c.cost_s * rate)).max(0.0),
+            wait_cost_per_s: rate,
+            // The donor, if the parts were not worth it after all.
+            risk_s: cfg.cannibalize_risk_s.max(stripped_s - without_s),
         };
         let max_wait = self.world.policy.level3.max_wait_s;
         let reach = self.reach(cfg);
-        let ask = match authority::level3_rule(&stakes, reach, now, max_wait, cfg.answer_margin) {
+        let rule = authority::level3_rule(&stakes, reach, now, max_wait, cfg.answer_margin);
+        // Earth is not asked the same thing twice. What it allowed stands,
+        // and is used again only if the parts are worth it now.
+        if self.authority.asked("cannibalize", &purpose) {
+            if rule.is_some()
+                && !self.strips.contains(&(donor, x))
+                && self
+                    .authority
+                    .authorization("cannibalize", &purpose, now)
+                    .is_some()
+            {
+                self.strips.push((donor, x));
+            }
+            return false;
+        }
+        let ask = match rule {
             Some(a) if authority::level(&self.world.policy, "cannibalize") == 3 => a,
             // Level 4: only worth asking if an answer can come, and never on a fallback.
             Some(a) if a.decide_by_t > now => authority::Ask {
@@ -1599,13 +1688,30 @@ impl State {
     /// How fast Earth can answer now: a round trip at the reported delay plus
     /// mission control's typical response time.
     fn reach(&self, cfg: &Config) -> Reach {
+        let now = self.world.now;
         let d = self.world.one_way_delay_s(cfg.assumed_delay_s);
-        let answer_s = 2.0 * d + cfg.earth_response_s;
+        let mut answer_s = 2.0 * d + cfg.earth_response_s;
+        let comms = self.world.comms.as_ref();
+        // On a link that works in pass windows the answer also has to find
+        // a pass. If it is not back before the window in progress closes,
+        // it waits out a gap: the whole of the next one when it would have
+        // come within that gap, about half of one otherwise.
+        if let Some(gap) = self.world.pass_gap_s {
+            let open_for = comms
+                .filter(|c| c.link == arcadia_protocol::Link::Up)
+                .and_then(|c| c.window_end_t)
+                .map(|end| (end - now).max(0.0));
+            answer_s = match open_for {
+                Some(open) if answer_s <= open => answer_s,
+                Some(open) if answer_s <= open + gap => open + gap,
+                _ => answer_s + 0.5 * gap,
+            };
+        }
         if self.world.link_up() {
             Reach::Up { answer_s }
         } else {
             Reach::Down {
-                back_t: self.world.comms.as_ref().and_then(|c| c.expected_restore_t),
+                back_t: comms.and_then(|c| c.expected_restore_t),
                 answer_s,
             }
         }
@@ -2620,6 +2726,78 @@ impl State {
         }
     }
 
+    /// How long the rest of the build would take the robots in `crew`, s:
+    /// the capacity plan's makespan for them, held to what the site
+    /// delivers. A crew that has lost every robot for some of the work
+    /// never finishes, which costs all the time the run has left.
+    fn build_time_s(&self, workload: &Workload, crew: &[bool], cfg: &Config) -> f64 {
+        let left_s = if self.world.time_limit_t > self.world.now {
+            self.world.time_limit_t - self.world.now
+        } else {
+            cfg.no_alternative_s.max(self.capacity.makespan_s)
+        };
+        // Work that no robot of this crew was ever built for is nobody's to
+        // lose; work whose every robot is out of `crew` is.
+        let undoable = workload.iter().any(|(&cap, w)| {
+            let built_for = self.reg.capable(cap);
+            w.steps > 0.0
+                && !built_for.is_empty()
+                && !built_for
+                    .iter()
+                    .any(|&r| crew.get(r).copied().unwrap_or(false))
+        });
+        if undoable {
+            return left_s;
+        }
+        let mut plan = CapacityPlan::solve(workload, &self.reg, crew, cfg);
+        plan.bound_by_power(self.deliverable_w());
+        plan.makespan_s.min(left_s)
+    }
+
+    /// The power the site can put into the crew over a sol, W: what its
+    /// station slots carry, or what the plant has to spare, whichever is
+    /// less.
+    fn deliverable_w(&self) -> f64 {
+        self.reg.total_slot_power_w().min(self.power.mean_spare_w())
+    }
+
+    /// How often Earth gets a status report while the link is up, s: the
+    /// configured period, which is a sol on Mars, kept to the scenario's
+    /// own sol where that differs.
+    fn status_period_s(&self, cfg: &Config) -> f64 {
+        let sol = self.world.sol_length_s;
+        if sol > 0.0 && (cfg.status_period_s - 88_775.0).abs() < 1.0 {
+            sol
+        } else {
+            cfg.status_period_s
+        }
+    }
+
+    /// How long idle robots can be left unlooked at, s. Whatever happens to
+    /// the crew arrives as an event and wakes ArcadiaOS by itself; the one
+    /// thing that does not is an idle robot's battery running down. So the
+    /// wait is until the first free robot would be half-way to needing to
+    /// park and charge, at its idle draw with the heater on, within
+    /// `idle_wake_s` and `idle_wake_max_s`. With nothing in flight at all,
+    /// or a robot waiting to be recovered, no event may be coming and the
+    /// short wake-up stands.
+    fn idle_wait_s(&self, free: &[usize], recoverable: bool, cfg: &Config) -> f64 {
+        if recoverable || self.exec.idle() {
+            return cfg.idle_wake_s;
+        }
+        let mut wait = cfg.idle_wake_max_s.max(cfg.idle_wake_s);
+        for &r in free {
+            let e = self.world.fleet.get(r);
+            let Some(pos) = e.position() else { continue };
+            let spare_wh = (e.battery_wh() - self.park_need_wh(r, pos, cfg)).max(0.0);
+            let draw_w = self.reg.idle_wh(r, 3600.0) * (1.0 + cfg.heater_idle_factor.max(0.0));
+            if draw_w > 0.0 {
+                wait = wait.min(0.5 * spare_wh / draw_w * 3600.0);
+            }
+        }
+        wait.max(cfg.idle_wake_s)
+    }
+
     /// Battery robot `r` at `at` needs to sit idle for the parking horizon
     /// (heater included on cold nights) and still reach a charger, Wh.
     fn park_need_wh(&self, r: usize, at: GridCoord, cfg: &Config) -> f64 {
@@ -2763,6 +2941,18 @@ impl State {
     }
 }
 
+/// Parts from a donor for a robot that is down, and what they are weighed
+/// against.
+struct Parts {
+    /// The strip: who takes the parts off which donor, and how long until
+    /// the robot is back.
+    strip: recovery::Plan,
+    /// The slow way back without parts, once the crew's hands are free.
+    slow: Option<recovery::Plan>,
+    /// Whether the donor works, or has its own way back.
+    donor_returns: bool,
+}
+
 /// Approval purpose for stripping `donor` to restore `target`.
 fn strip_purpose(reg: &Registry, donor: usize, target: usize) -> String {
     format!("strip {} for {}", reg.robot(donor).id, reg.robot(target).id)
@@ -2890,9 +3080,14 @@ fn describe_capacity(plan: &CapacityPlan, reg: &Registry) -> String {
         }
     }
     format!(
-        "capacity plan{}: makespan {:.1} h; {}",
+        "capacity plan{}: makespan {:.1} h{}; {}",
         if plan.optimal { "" } else { " (fallback)" },
         plan.makespan_s / 3600.0,
+        if plan.power_s >= plan.makespan_s && plan.power_s > 0.0 {
+            ", set by the power the site delivers"
+        } else {
+            ""
+        },
         parts.join("; ")
     )
 }
@@ -2900,6 +3095,7 @@ fn describe_capacity(plan: &CapacityPlan, reg: &Registry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::CapWork;
     use crate::diag::Level;
     use crate::registry::tests::{cap, robot, scenario};
     use arcadia_protocol::*;
@@ -3419,6 +3615,152 @@ mod tests {
         }
     }
 
+    /// A `comms` report at `t` on a link that works in pass windows.
+    fn pass(t: f64, link: Link, restore: Option<f64>, window_end: Option<f64>) -> Event {
+        Event {
+            t,
+            kind: EventKind::Comms {
+                link,
+                cause: if link == Link::Up {
+                    CommsCause::Nominal
+                } else {
+                    CommsCause::BetweenPasses
+                },
+                one_way_delay_s: 600.0,
+                expected_restore_t: restore,
+                window_end_t: window_end,
+            },
+        }
+    }
+
+    #[test]
+    fn an_answer_from_earth_has_to_find_a_pass() {
+        let mut os = Coordinator::with_config(Config::default(), Diag::new(Level::Off));
+        let mut told = hello();
+        told.scenario.constants = Some(crate::config::tests::sent());
+        os.start(told);
+        let cfg = os.cfg.clone();
+        let robots = || vec![state("scout", 1, 1), state("worker", 1, 2)];
+        let mut seq = 0;
+        let mut observe = |os: &mut Coordinator, t: f64, events: Vec<Event>| {
+            os.decide(&Observation {
+                seq,
+                t,
+                events,
+                robots: robots(),
+            });
+            seq += 1;
+        };
+        let reach = |os: &Coordinator| os.state.as_ref().unwrap().reach(&cfg);
+        // Light there and back, and the four hours the simulator says Earth
+        // takes: with a link that has shown no pass windows, that is all.
+        let plain = 2.0 * 600.0 + 14_400.0;
+        observe(&mut os, 0.0, vec![comms(Link::Up, CommsCause::Nominal)]);
+        assert_eq!(
+            reach(&os),
+            Reach::Up {
+                answer_s: 2.0 * 720.0 + 14_400.0
+            }
+        );
+        // A window closes and the next pass is five hours off: gaps are
+        // five hours long, as far as this link has shown.
+        let gap = 18_000.0;
+        observe(
+            &mut os,
+            100.0,
+            vec![pass(100.0, Link::Down, Some(100.0 + gap), None)],
+        );
+        assert_eq!(
+            reach(&os),
+            Reach::Down {
+                back_t: Some(100.0 + gap),
+                answer_s: plain + 0.5 * gap
+            }
+        );
+        // A ten-minute relay pass: the answer cannot be back before it
+        // closes. It is ready during the gap that follows, so it arrives
+        // when the next pass opens.
+        let t = 100.0 + gap;
+        observe(&mut os, t, vec![pass(t, Link::Up, None, Some(t + 600.0))]);
+        assert_eq!(
+            reach(&os),
+            Reach::Up {
+                answer_s: 600.0 + gap
+            }
+        );
+        // An Earth that takes longer than a pass and a gap together: where
+        // its answer falls among the passes is anyone's guess, and it waits
+        // about half a gap for one.
+        let slow = Config {
+            earth_response_s: 30_000.0,
+            ..cfg.clone()
+        };
+        let st = os.state.as_ref().unwrap();
+        assert_eq!(
+            st.reach(&slow),
+            Reach::Up {
+                answer_s: 1200.0 + 30_000.0 + 0.5 * gap
+            }
+        );
+        // A long window that outlasts the answer adds nothing.
+        let t = t + 1000.0;
+        observe(
+            &mut os,
+            t,
+            vec![pass(t, Link::Up, None, Some(t + 30_000.0))],
+        );
+        assert_eq!(reach(&os), Reach::Up { answer_s: plain });
+    }
+
+    #[test]
+    fn idle_robots_are_looked_at_when_their_batteries_call_for_it() {
+        let mut os = Coordinator::with_config(Config::default(), Diag::new(Level::Off));
+        os.start(hello());
+        let cfg = os.cfg.clone();
+        os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal()],
+            robots: vec![state("scout", 1, 1), state("worker", 1, 2)],
+        });
+        let st = os.state.as_ref().unwrap();
+        // Commands are in flight after the first decision. A robot with a
+        // full battery can be left for the longest wait...
+        assert!(!st.exec.idle());
+        assert_eq!(st.idle_wait_s(&[1], false, &cfg), cfg.idle_wake_max_s);
+        // ...one waiting to be recovered cannot...
+        assert_eq!(st.idle_wait_s(&[1], true, &cfg), cfg.idle_wake_s);
+        // ...and nor can one whose battery is nearly down to what parking
+        // needs: it is looked at again at the short interval.
+        let pos = GridCoord { x: 1, y: 2 };
+        let need = st.park_need_wh(1, pos, &cfg);
+        let mut low = state("worker", 1, 2);
+        low.battery_wh = need + 1.0;
+        let mut os2 = Coordinator::with_config(Config::default(), Diag::new(Level::Off));
+        os2.start(hello());
+        os2.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal()],
+            robots: vec![state("scout", 1, 1), low],
+        });
+        let st2 = os2.state.as_ref().unwrap();
+        assert_eq!(st2.idle_wait_s(&[1], false, &cfg), cfg.idle_wake_s);
+        // In between, the wait is half the time the spare charge lasts at
+        // the idle draw with the heater on.
+        let wait = st.idle_wait_s(
+            &[1],
+            false,
+            &Config {
+                idle_wake_max_s: 1e9,
+                ..cfg.clone()
+            },
+        );
+        let draw_w = st.reg.idle_wh(1, 3600.0) * (1.0 + cfg.heater_idle_factor);
+        let spare = 5000.0 - need;
+        assert!((wait - 0.5 * spare / draw_w * 3600.0).abs() < 1.0, "{wait}");
+    }
+
     fn earth(t: f64, body: Uplink) -> Event {
         Event {
             t,
@@ -3523,13 +3865,19 @@ mod tests {
     /// A sinterer and a spare one, both failed beyond field repair, a third
     /// sinterer working, and a scout that can strip and fit parts. Nothing
     /// can tow and there is no depot, so parts from the spare are the only
-    /// way to bring the sinterer back.
+    /// way to bring the sinterer back. The pad is half a sol of sintering
+    /// for one robot, so a second one is worth hours.
     fn strip_os(cannibalize: u8, cfg: Config) -> (Coordinator, Vec<RobotState>) {
+        strip_os_at(cannibalize, cfg, 0.0002)
+    }
+
+    /// [`strip_os`] with sinterers that work at `rate` m2/s.
+    fn strip_os_at(cannibalize: u8, cfg: Config, rate: f64) -> (Coordinator, Vec<RobotState>) {
         let sinterer = |id: &str| {
             robot(
                 id,
                 0.15,
-                vec![cap(CapabilityName::Sinter, 0.01, 60.0, None)],
+                vec![cap(CapabilityName::Sinter, rate, 60.0, None)],
             )
         };
         let mut sc = scenario(vec![
@@ -3676,6 +4024,102 @@ mod tests {
             robots,
         });
         assert!(strip_command(&d).is_none());
+    }
+
+    #[test]
+    fn a_robot_is_worth_the_time_the_build_would_lose_without_it() {
+        // The same crew with a pad that one sinterer finishes in a quarter
+        // of an hour: fitting parts would take longer than the work that is
+        // left, so the spare is left whole and Earth is not asked.
+        let (mut os, robots) = strip_os_at(3, Config::default(), 0.01);
+        let d = os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal(), comms(Link::Up, CommsCause::Nominal)],
+            robots,
+        });
+        assert!(approval_request(&d).is_none());
+        // The figures behind it, on the pad that takes half a sol.
+        let (mut os, robots) = strip_os(3, Config::default());
+        os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal(), comms(Link::Up, CommsCause::Nominal)],
+            robots,
+        });
+        let cfg = os.cfg.clone();
+        let st = os.state.as_ref().unwrap();
+        let mut work = Workload::new();
+        work.insert(
+            CapabilityName::Sinter,
+            CapWork {
+                units: 9.0,
+                steps: 9.0,
+                travel_m_per_step: 1.0,
+                passes: 1.0,
+            },
+        );
+        // Robots: the failed sinterer, the scout, the failed spare, the
+        // working sinterer.
+        let one = st.build_time_s(&work, &[false, true, false, true], &cfg);
+        let two = st.build_time_s(&work, &[true, true, false, true], &cfg);
+        assert!(one > 45_000.0 && one < 50_000.0, "{one}");
+        assert!((two - 0.5 * one).abs() < 1.0, "{two}");
+        // A scout more or less changes nothing for sintering.
+        assert_eq!(
+            st.build_time_s(&work, &[false, false, false, true], &cfg),
+            one
+        );
+        // With no sinterer left the pad is never finished: that costs all
+        // the time the run has.
+        let left = st.world.time_limit_t - st.world.now;
+        assert!(left > one);
+        assert_eq!(
+            st.build_time_s(&work, &[false, true, false, false], &cfg),
+            left
+        );
+        // Work no robot here was built for is nobody's to lose.
+        work.insert(
+            CapabilityName::Dig,
+            CapWork {
+                units: 1.0,
+                steps: 9.0,
+                travel_m_per_step: 1.0,
+                passes: 1.0,
+            },
+        );
+        assert_eq!(
+            st.build_time_s(&work, &[false, true, false, true], &cfg),
+            one
+        );
+    }
+
+    #[test]
+    fn a_donor_is_released_when_the_parts_are_no_longer_needed() {
+        let (mut os, mut robots) = strip_os(3, Config::default());
+        let d = os.decide(&Observation {
+            seq: 0,
+            t: 0.0,
+            events: vec![goal(), comms(Link::Up, CommsCause::Nominal)],
+            robots: robots.clone(),
+        });
+        assert!(approval_request(&d).is_some());
+        // The spare (robot 2) is held as the donor for the worker (robot 0).
+        let st = os.state.as_ref().unwrap();
+        assert_eq!(st.strips, vec![(2, 0)]);
+        assert!(st.strip_live(|d, _| d == 2));
+        // The worker comes back another way before Earth answers: the spare
+        // is a robot to recover again, not one waiting to be stripped.
+        robots[0] = state("worker", 12, 12);
+        os.decide(&Observation {
+            seq: 1,
+            t: 600.0,
+            events: vec![],
+            robots,
+        });
+        let st = os.state.as_ref().unwrap();
+        assert!(st.strips.is_empty());
+        assert!(!st.strip_live(|d, _| d == 2));
     }
 
     #[test]

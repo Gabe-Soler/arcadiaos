@@ -85,11 +85,23 @@ Each pad cell moves through **survey → dig → fill (only when low) → grade 
 | Cleared, lower than target − 0.10 m | Fill up to target − 0.05 m |
 | Cleared, within the window | Grade |
 | Graded | Compact |
-| Compacted | Sinter (or finished when the pad needs no stabilising) |
+| Compacted | Sinter (or finished when the pad needs no stabilising); a crew that sinters slowly measures it first, see below |
 | Stabilised and within tolerance | Finished, then verified by a scan |
 | Prepared but out of tolerance, or marked for rework | Regrade, re-cut or refill, depending on how far off it is |
 
 The thresholds rest on one interface assumption: grading levels a cell only within 0.15 m of the target. ArcadiaOS keeps a margin inside that window. If a grade is still refused, it tightens that cell's window and brings the cell much closer to the target first, so a narrower simulator window is handled too.
+
+### Settlement and measured fit
+
+Compaction lowers a cell by the settlement the simulator states (`compaction_settlement_m`: 1 cm in protocol 1.0's reference constants, 4 cm in ArcadiaBench's catalog 1.1). So digging, filling and grading aim at the target raised by that much, and a graded cell is judged against the raised level.
+
+Where sintering is slow, a cell is measured before it is sintered. On catalog 1.1 a square metre takes seven hours and 37 kWh to sinter, and a compacted cell out of line costs minutes to regrade.
+
+- **Averaged scans.** A scan's height carries about a centimetre of error. Scans of a cell whose surface has not moved since are averaged, so the error of the estimate falls with the square root of their number. The average starts again when work moves the surface, when a scan shows a different surface, or when a reading is more than 5 cm from the mean.
+- **Fit.** A compacted cell is fit to sinter when its averaged height is inside the tolerance, less a 5 mm margin, and its step to each compacted or sintered neighbour is inside the slope limit, each by two standard errors. A cell clearly outside is regraded. A cell too close to call is scanned again, up to 16 times.
+- **Who gives way.** A step over the limit is charged to the cell that is not yet sintered, or else to the one farther from the target, so one regrade settles it.
+- **Batching.** Cells to measure join the verification scan. They are scanned once a batch has accumulated, and at once in the end game or when fewer than eight cells are ready to sinter.
+- **Only where it pays.** A crew is careful in this way when its quickest sinterer needs at least `careful_sinter_s` (900 s) for a cell. A crew that sinters a cell in a minute or two, as on catalog 1.0, sinters first and reworks afterwards.
 
 ### Sections and sweep order
 
@@ -115,7 +127,11 @@ Berm cells are surveyed first, to learn their base elevation and density. Hauls 
 
 - **Verification batches.** Finished cells are verified in batches: a scan of the bounding box of the finished but unverified cells, once enough have accumulated. In the end game (the last few cells) every finished cell is scanned right away, and idle scanners wait at the work front, so the final verification follows the last sinter within seconds.
 - **Rework.** A scan showing a finished cell out of tolerance sends it back for rework.
-- **Recheck.** If every cell looks finished and verified but the run continues, something is hidden: a slope just over the limit, or a berm cell a little short. The planner then requests a whole-site recheck scan. It reworks the most suspicious cells (furthest from the target, or the steepest step) and tops up the weakest berm cells. Each round always schedules something, so the run never stalls.
+- **Recheck.** If every cell looks finished and verified but the run continues, something is hidden: a slope just over the limit, or a berm cell a little short. The planner then requests a whole-site recheck scan.
+  - **A crew that sinters quickly** reworks the most suspicious cells (furthest from the target, or the steepest step), up to four a round, and tops up the weakest berm cells.
+  - **A careful crew** measures first. Each cell gets a score: how far its averaged height, or its step to a neighbour, is past the limit, in standard errors. Cells more than three standard errors past a limit are redone, all at once. Otherwise, while some cell is not clearly inside and has fewer than 48 scans, the pad is scanned again: a scan takes minutes and a cell redone takes hours. When scanning has told what it can, the one cell with the highest score is redone. Each round that fails allows as many scans again.
+  - **A sintered cell is judged on the scans made since it was sintered.** It was sintered because the earlier scans looked good, so their mean flatters a cell near a limit. In one catalog 1.1 run this hid a 3.61 cm step, against a limit of 3.49 cm, through 79 rechecks.
+  - Each round always schedules something, so the run never stalls.
 
 ## Allocation method
 
@@ -132,7 +148,17 @@ subject to Σ_r f[r,k] ≥ 1          for every capability k
            f ≥ 0
 ```
 
-`f[r,k]` is robot `r`'s share of capability `k`, and `T` is the makespan if the work were perfectly divisible. The small second term picks, among makespan-optimal splits, the one using the least robot time, so each robot stays on what it does best. In the default crew, the excavator could also haul, but the dedicated hauler keeps up alone and is faster, so hauling is not one of the excavator's roles. Shares become **roles**. The plan is re-solved when the fleet changes, when a capability's work runs out, and every time the remaining work drains by 15%. It is small (one variable per robot-capability pair), so it is solved exactly by an in-tree dense simplex with Bland's rule. That needs no solver dependency, and the result is deterministic.
+`f[r,k]` is robot `r`'s share of capability `k`, and `T` is the makespan if the work were perfectly divisible. The small second term picks, among makespan-optimal splits, the one using the least robot time, so each robot stays on what it does best. In the default crew, the excavator could also haul, but the dedicated hauler keeps up alone and is faster, so hauling is not one of the excavator's roles. Shares become **roles**. The plan is re-solved when the fleet changes, when a capability's work runs out, every time the remaining work drains by 15%, and when work appears that it knows nothing of: a capability that had none, or a workload grown 15% past the one planned. Rework found at the end of a build is such work. Before this, it met a plan solved for a finished pad, in which no robot had the role, so no robot was sent to charge for it. It is small (one variable per robot-capability pair), so it is solved exactly by an in-tree dense simplex with Bland's rule. That needs no solver dependency, and the result is deterministic.
+
+**The plant's limit.** Each robot's time includes its own charging, but the crew shares the station slots and one plant. So the makespan is held to the time the site needs to deliver the energy of the remaining work:
+
+```text
+deliverable = min(power of all station slots,
+                  fission + solar peak × transmittance / π − essential load)
+makespan    = max(T, energy of the remaining work / deliverable)
+```
+
+The solar term is the sol's mean of the clear-sky curve at the dust last measured. The shares stay as solved: who does what best does not depend on the plant, only how long the build takes and what each robot's time is worth. On catalog 1.1's Large outposts the plant is the limit. The crew there already uses 96 to 98% of what it generates, so there is little for scheduling to win.
 
 ### Dispatch (sequential auction)
 
@@ -203,7 +229,7 @@ Each candidate is costed in seconds until the robot is back:
 
 The cheapest permitted option wins; ties go to the lower helper index. Helpers are free robots or robots on interruptible jobs. A helper that cannot afford the step is sent to charge for it. While a mobile charger is on its way, the robot waits for it. Engaged robots (being repaired or towed, or a charger in use) are never offered other commands.
 
-**Authority.** Every option names the policy action it uses, and the authority layer gates it: levels 1 and 2 are taken (`tow`, level 2 in the default policy, gets its `notify`), higher levels only with an approval in hand. A donor for cannibalizing must be disabled and redundant: every capability it has, another working robot also has. When parts from a donor would beat every allowed option, ArcadiaOS asks Earth and holds the robot for the answer; see [Authority and Earth](#authority-and-earth).
+**Authority.** Every option names the policy action it uses, and the authority layer gates it: levels 1 and 2 are taken (`tow`, level 2 in the default policy, gets its `notify`), higher levels only with an approval in hand. A donor for cannibalizing must be disabled and redundant: every capability it has, another working robot also has. When parts from a donor would beat every allowed option and are worth it by the level-3 rule, ArcadiaOS asks Earth and holds the robot for the answer; see [Authority and Earth](#authority-and-earth). A donor is held only while the robot it is meant for still needs the parts: if that robot comes back another way, the donor is a robot to recover again.
 
 ## Authority and Earth
 
@@ -235,6 +261,7 @@ The outline names this the core research problem: weighing the cost of waiting a
 
 ```text
 expected = time until the link is up + 2 × one-way delay + Earth's response time
+           + the wait for a pass, on a link that works in pass windows
 wait     = min(margin × expected, max_wait_s)  if expected ≤ max_wait_s,  else 0
 net      = benefit − wait × wait_cost
 ask        only if net > 0
@@ -242,20 +269,28 @@ fallback = proceed if net > risk, else abort
 ```
 
 - **Waiting is worth it only if an answer can come in time.** The expected answer time uses the latest `comms` report: the one-way delay, and when the link is down, `expected_restore_t` if the site knows it (a conjunction), else never (an outage). If Earth cannot answer within the policy's `max_wait_s`, ArcadiaOS does not wait pointlessly: the request goes out with `decide_by_t` now, and the fallback decides at the next decision.
+- **Pass windows.** On a link that is up only in passes, the answer also has to find a pass. If it would be back before the window in progress closes, nothing is added. If it would be ready during the gap that follows, it arrives when the next pass opens. Otherwise about half a gap is added. The gap is the mean of those the link has shown so far.
 - **A request that changes nothing is not sent**: no time to wait and fallback abort.
-- **For cannibalizing**, `benefit` is the time the robot is back sooner than by the best allowed option (towing to a depot and servicing, a field repair, …; a sol when nothing else can bring it back), `wait_cost` is the robot's weight (its capacity-plan utilisation, at least 0.2: a bottleneck's hour costs the crew an hour), and `risk` is `cannibalize_risk_s`, the expected cost of stripping a robot Earth would rather keep. At level 4 only an approval counts, so ArcadiaOS asks only when an answer can come within `max_wait_s`, and otherwise takes the best allowed option.
+- **For cannibalizing**, a robot is worth the time the build would lose without it. The rest of the build is planned four ways with the capacity plan, held to the plant's limit: with the crew as it is, with the robot back as well, with the robot in the donor's place, and with both gone.
+  - `wait_cost` is the share of the build's pace lost while the robot is down: 0 for one sinterer of ten on a short plant, near 1 for a crew's only compactor.
+  - `benefit` is the build time saved by fitting the parts now, against the slow way back (a tow to a depot and a service, a field repair), or against never having the robot if there is none. The slow way counts even when the hands for it are busy at this moment.
+  - `risk` is what the build loses with the donor gone and the robot still down, and at least `cannibalize_risk_s`. A donor that is down but has its own way back counts as a robot the crew has.
+  - Earth is not asked the same thing twice. An approval that still stands is used again only if the parts are worth it by the same figures.
+  - At level 4 only an approval counts, so ArcadiaOS asks only when an answer can come within `max_wait_s`, and otherwise takes the best allowed option.
 - **Routine actions** at level 3 have no risk to speak of, so their fallback is proceed.
 
 | Parameter | Value | Meaning |
 |---|---|---|
-| `earth_response_s` | 1200 s | Mission control's typical response time (interface assumption). |
+| `earth_response_s` | 1200 s | Mission control's typical response time: what the simulator sends, or this. Catalog 1.1 sends four hours. |
 | `answer_margin` | 1.5 | Waiting stretches to 1.5 × the expected answer time, within `max_wait_s`. |
-| `cannibalize_risk_s` | 21,600 s | A robot lost for good: six hours of crew time. |
-| `no_alternative_s` | 88,775 s | What cannibalizing gains when nothing else can bring the robot back: a sol. |
+| `cannibalize_risk_s` | 21,600 s | The least a stripped donor is priced at: six hours of crew time. |
+| `no_alternative_s` | 88,775 s | Stands in for the time a run has left when a scenario gives no time limit: a sol. |
 | `routine_benefit_s` | 14,400 s | What a standing approval of a routine action is worth. |
 | `assumed_delay_s` | 720 s | One-way delay before the first `comms` report. |
 
-At the default delay of 720 s an answer is expected in 2640 s, within the default policy's hour, so ArcadiaOS waits up to the hour. In the `conjunction` variant the delay is near 1440 s, an answer would take over an hour, and the rule decides at once even while the link is up.
+On catalog 1.0, at the default delay of 720 s an answer is expected in 2640 s, within the default policy's hour, so ArcadiaOS waits up to the hour. In its `conjunction` variant the delay is near 1440 s, an answer would take over an hour, and the rule decides at once even while the link is up.
+
+On catalog 1.1 Earth takes about four hours, the link is down for about 21 hours of every sol, and the policy allows a wait of one sol. An answer usually has to wait out a gap, so most questions would be answered too late and the rule decides at once. Over seeds 1 to 50 of all 18 scenarios ArcadiaOS strips no robot: where a depot can bring a robot back in a few hours, parts are not worth a donor.
 
 ### Earth messages, reports and blackouts
 
@@ -287,29 +322,33 @@ On ArcadiaBench the base station covers the pad but not the berm. Building the b
 
 ## Health and predictive maintenance
 
-[`health`](../src/health.rs) infers wear, which is never reported:
+[`health`](../src/health.rs) infers wear, which is never reported. No message carries a site's wear rates either, so they are read from what the robots show, not assumed per catalog:
 
-- **Telemetry.** Wheel slip, motor current and dust coverage are smoothed per robot. Each has an exponentially weighted level, plus a trend per hour fitted between anchors at least ten minutes apart. Wheel wear follows from slip and drive-motor wear from motor current, net of a known fault's offset. Joint wear follows from dust coverage, net of the sensors' share.
-- **Usage.** Tool, sensor and battery wear come from usage since the robot was last as good as new: hours of work, exposed hours and kWh drawn. They are counted at nominal rates scaled by the site's *observed* wear rate, which is the ratio of measured wheel and drive-motor wear to what the same driving gives at nominal rates, pooled over the crew. A harsh site shows within the first kilometres; `cascading_faults` reads about ×3.5.
+- **Wheels and drive motor.** Wheel slip and motor current are smoothed per robot: an exponentially weighted level, plus a trend per hour fitted between anchors at least ten minutes apart. Wear is the level above the robot's own first readings, net of a known fault's offset.
+- **Joints and sensors.** Dust coverage above the robot's first readings, shared between the two.
+- **Tool.** The energy the robot's tool work draws over the estimate: a moving average of actual over planned energy, for steps of at least 20 Wh. What is left past a fully worn tool is the battery's.
+- **Growth.** Per component, the wear a robot has gained per exposed hour since its last maintenance, once it has been exposed for two hours. Before that, the crew's average. Before any robot has shown any, nominal rates scaled by the site's observed wear rate.
 
-A field repair cuts the estimate by the repair fraction; a depot service resets it.
+A field repair cuts the estimate by the repair fraction the simulator states; a depot service resets it, with the robot's smoothed telemetry and its calibration.
 
 **The rule.** Failures follow an assumed hazard of `k · w³` per component per exposed hour, with `k` scaled by the observed wear rate. For a robot with `H` planned hours of work left, maintenance pays when
 
 ```text
+pays_h  = wear removed / growth × (1 + kept) / (2 × (1 − kept))
 benefit = Δ(expected faults over the next 4 h) × fault cost × weight
         + degraded-fault slowdown removed × H × weight
-        + wear slowdown removed × H × weight
-benefit ≥ ratio × (downtime + 900 s overhead)   and   benefit ≥ 600 s
+        + wear slowdown removed × min(H, pays_h) × weight
+benefit ≥ ratio × (downtime + 300 s overhead)   and   benefit ≥ 600 s
 ```
 
 - `weight` is the robot's utilisation in the capacity plan, at least 0.2. A bottleneck's lost hour costs the whole crew an hour.
 - The wear slowdown is the extra time the estimated wear costs the robot's mix of driving, work and scanning (each effect assumed linear in wear), plus a third of the extra energy for the charging it costs.
+- **`pays_h`: maintenance is counted for as long as it pays.** Wear keeps growing, and later maintenance would take the same wear off in its turn. For a robot maintained whenever its wear reaches a level, keeping a fraction `kept` at each stop, the cost per hour is least where the slowdown removed, held for `pays_h`, equals the cost of the stop. Counting the gain over all of `H` made every hour of a build of weeks look like an emergency: about 600 preventive repairs a run on catalog 1.1.
 - Risk is projected only four hours ahead, because maintenance can always be done later.
 - `ratio` is 1 at a **natural break** and 2 when the stop interrupts work. A natural break is a robot with nothing to do, blocked on energy, or about to charge.
-- A field repair halves wear and clears degraded faults. A depot service resets wear but costs hours, so it wins only when no repairer exists or wear is extreme.
+- Of a field repair and a depot service, the one that returns more per second of downtime is chosen. A repair halves wear and clears degraded faults. A service resets wear but costs hours, so it wins only when no repairer exists or wear is extreme.
 
-Late in the run `H` is small, so maintenance stops by itself. The fixed overhead models what the simulator does not charge: stopping work, waiting for the repairer, and its trip back. It keeps preventive repairs to a realistic cadence. In `cascading_faults` that is about five per run, every one to two hours once a bottleneck's summed wear reaches about 0.3–0.5. In `nominal` it is fewer than one per run, always at a natural break.
+Late in the run `H` is small, so maintenance stops by itself. The fixed overhead models what the simulator does not charge: stopping work, waiting for the repairer, and its trip back. On catalog 1.1 a Medium crew makes about 150 to 180 preventive repairs over a build of 25 sols, two to three minutes each, and two to six depot services.
 
 ## Energy: nights and the site grid
 
@@ -317,7 +356,8 @@ Late in the run `H` is small, so maintenance stops by itself. The fixed overhead
 - **Optional charging waits.** Opportunistic top-ups, tank refills and parking charges are held back while the forecast says they would push the bank below a quarter of its capacity before the next sunrise. Charging that work needs always proceeds; an empty bank only slows it, and the energy policy plans for that.
 - **Surplus windows.** While the bank is nearly full and the sun is up, idle robots top up: energy that would otherwise be curtailed.
 - **Station slots.** Optional charges leave a slot free for working robots. A robot that needs a slot for work cuts short an optional session holding the last one.
-- **Nights.** Robot heaters run while the air is colder than a threshold, which the simulator sends, and add to idle drain. When that will be is forecast as a window of the sol. The window starts as an assumption, deliberately wider than the reference simulator's, and a temperature seen on the wrong side of the threshold moves its nearer edge: the air temperature in a `weather` report, or a robot whose own reading is well under the threshold. A robot with no work left keeps enough charge to idle for twelve hours with the heater, and still reach a charger; below that it parks charged at a station. Decisions recur at least every 15 minutes while any robot is idle or disabled, so low-water marks are checked through the night.
+- **Nights.** Robot heaters run while the air is colder than a threshold, which the simulator sends, and add to idle drain. When that will be is forecast as a window of the sol. The window starts as an assumption, deliberately wider than the reference simulator's, and a temperature seen on the wrong side of the threshold moves its nearer edge: the air temperature in a `weather` report, or a robot whose own reading is well under the threshold. A robot with no work left keeps enough charge to idle for twelve hours with the heater, and still reach a charger; below that it parks charged at a station.
+- **Wake-ups.** Whatever happens to the crew arrives as an event and brings a decision by itself. The one thing that does not is an idle robot's battery running down. So while some robots work and others idle, ArcadiaOS asks to be woken when the first idle robot would be half-way to needing to park and charge, at its idle draw with the heater on: no sooner than 15 minutes, no later than two hours. With nothing in flight at all, or a robot waiting to be recovered, it wakes every 15 minutes. A catalog 1.1 build of 49 sols takes about 3,700 decisions; with a wake-up every 15 minutes whenever a robot idled it took 7,400.
 - **Mobile charger to the field.** When a robot needs a charge and a free mobile charger driving over costs less than the robot's own best trip and return (counting the charger's time at its utilisation), the charger comes to it. Slow robots far from a busy or weak station benefit most.
 - **Heavy work.** Charge targets cover each robot's remaining share of the work, so energy-hungry work such as sintering runs between full charges without topping up mid-sequence.
 
@@ -351,10 +391,12 @@ ArcadiaOS never issues a command that would complete instantly, such as a move t
 
 - **Unit tests next to each module:** geometry, site knowledge, registry and performance factors, simplex, capacity plan, planner (including berm borrow cells), material ledger, energy, allocator (including covered scan entries, costed stranding and feeding steps), executor, health (smoothing, wear, calibration, the maintenance rule), power (forecast, deferral, surplus, cold window), recovery (every step, donors and the authority hooks), authority (the level-3 rule, approvals, fallbacks and vetoes, notifies, status reports) and coverage (transitive relays, scan areas).
 - **Coordinator tests:** tow to the depot then service in place, charge in place at a station, a mobile charger for an offline robot, repair of a stuck and failed robot, parking charged before the night, a mobile charger driving to a slow robot, lost robots never commanded, a level-2 tow notified in the same decision, a policy update applied on arrival, cannibalizing asked about and done on approval (and not on a veto), the fallback deciding at once in a blackout (and nothing done at level 4), robots out of contact never commanded, and a relay stationed for work beyond coverage.
-- **`tests/crews.rs`:** synthetic scenarios on a small deterministic simulator written from the interface semantics. It covers crews of 3, 4, 5, 10 and 20 robots, generalists, mixed and overlapping capability sets, several stations, fifth-size batteries and a crew with no hauler. A mobile charger beats a weak, distant station, and a robot stranded too far from any charger is rescued by one. It also checks determinism and the per-decision time.
+- **`tests/crews.rs`:** synthetic scenarios on a small deterministic simulator written from the interface semantics. It covers crews of 3, 4, 5, 10 and 20 robots, generalists, mixed and overlapping capability sets, several stations, fifth-size batteries and a crew with no hauler. A mobile charger beats a weak, distant station, and a robot stranded too far from any charger is rescued by one. It also checks determinism and the per-decision time. The simulator's world is a parameter: one crew builds in a world like catalog 1.1 (4 cm of settlement, errors on graded, settled and scanned heights, sinterers that take seven hours and 37 kWh a cell, constants in `hello`) and has to sinter no cell twice.
 - **`tests/robustness.rs`:** hostile rejections, malformed but valid goals, unknown robots and commands, no stations and immobile robots.
 - **`tests/session.rs`:** the real binary over stdio. It covers the handshake, version errors, planning once the goal arrives, back-off after a rejection, and silence by default.
-- **`tests/bench.rs`:** the real binary under ArcadiaBench (`nominal` and `conjunction` variants), when `ARCADIABENCH` is set. Seeds 1–3 of each must finish `goals_complete` with no robot lost, no policy violation, no `approval_required` or `out_of_coverage` rejection and at least one status report (metrics are read from `run_end`), and the same seed twice must give byte-identical logs.
+- **`tests/bench.rs`:** the real binary under ArcadiaBench, when `ARCADIABENCH` is set.
+  - Catalog 1.0, `nominal` and `conjunction` variants: seeds 1–3 of each must finish `goals_complete` with no robot lost, no policy violation, no `approval_required` or `out_of_coverage` rejection and at least one status report (metrics are read from `run_end`), and the same seed twice must give byte-identical logs.
+  - Catalog 1.1: one build on each of Small, Medium and Large must finish sooner than the greedy baseline's mean, with no robot lost, no policy violation and fewer than 5,000 decisions.
 
 ## Results
 
@@ -376,6 +418,23 @@ ArcadiaBench 1.0 benchmarks ArcadiaOS 1.0 and its three baseline coordinators on
 
 ArcadiaBench's [demo replays](https://github.com/Gabe-Soler/arcadiabench/blob/main/docs/demos.md) show ArcadiaOS through a nominal build, a dust storm, a conjunction blackout and cascading faults.
 
+### Catalog 1.1, before its results are published
+
+ArcadiaBench 1.1's default catalog makes the build take weeks: seven hours and 37 kWh to sinter a square metre, 4 cm of settlement, wear and faults that build up, a plant that the Large crew outgrows, and an Earth reachable in short passes. ArcadiaOS 1.0's rules timed out on it. These are development measurements of this version against ArcadiaBench's greedy baseline, seeds 1–50, on ArcadiaBench `main`; the published tables come with ArcadiaBench 1.1's results.
+
+| Headline | Small | Medium | Large |
+|---|---|---|---|
+| ArcadiaOS, `nominal` | **0.764** (49.1 sols) | **0.764** (24.6) | **0.692** (16.3) |
+| greedy baseline, `nominal` | 0.690 (54.7) | 0.683 (27.7) | 0.627 (18.1) |
+| ArcadiaOS, `cascading_faults` | **0.722** | **0.726** | **0.664** |
+| greedy baseline, `cascading_faults` | 0.630 | 0.654 | 0.599 |
+| ArcadiaOS, `solar_only` | **0.761** | **0.708** | **0.496** |
+| greedy baseline, `solar_only` | 0.676 | 0.649 | 0.450 |
+
+- ArcadiaOS finished all 900 runs with no policy violation and no robot lost, and has the higher headline in all 18 scenarios, by 9 to 15%. Greedy finished 899.
+- It takes about 3,500 decisions a run, against greedy's 3,000.
+- **Where the time goes.** Sintering 400 cells takes 14.8 MWh, 96% of all the energy the robots use. On Small and Medium the sinterers set the pace. On Large, and with solar power only, the plant does: the crew draws all it generates, so the remaining differences between coordinators there are in the energy spent on anything other than sintering.
+
 ## Extension points
 
 - **Approvals.** New level-3 actions plug into `State::weigh_cannibalize` (its stakes) or `State::ask_earth` (generic), and are cited from `Authority::authorization`.
@@ -393,8 +452,9 @@ All assumptions and knobs live in `Config` (`src/config.rs`). They cover:
 - tow, service and repair assumptions;
 - the health model (telemetry coefficients, nominal wear rates, the hazard, wear and degraded-fault effects);
 - maintenance thresholds;
-- the cold window, parking horizon and bank thresholds;
+- measuring before sintering: the scan error assumed, the margin, how many standard errors decide, how often a cell is scanned, and when a crew counts as careful;
+- the cold window, parking horizon, wake-up bounds and bank thresholds;
 - Earth and authority: the response time, the answer margin, the risk and benefit prices of the level-3 rule, and the status period;
 - coverage: the lost-link timeout, relay radio power, borrow depth, relay benefit ratio and stranding margin.
 
-The grade window, the compaction settlement, the work floor, the rock density, the tow, service, repair and cannibalizing numbers, the heater's threshold and draw, the Earth response time, the lost-link timeout and the relay radio power are sent by a protocol 1.1 simulator, and ArcadiaOS uses what it is sent (`Config::with_constants`). Its own values for them are protocol 1.0's reference constants, used only when a `hello` carries none. The health model's coefficients and nominal wear rates are still assumptions: no message carries them, and they come from ArcadiaBench's `docs/simulator.md` for its catalog 1.0. The cold window starts deliberately wider than the reference simulator's. ArcadiaOS uses these numbers to rank options, and corrects energy and time estimates from what it measures. None is specific to a seed, a crew or a site.
+The grade window, the compaction settlement, the work floor, the rock density, the tow, service, repair and cannibalizing numbers, the heater's threshold and draw, the Earth response time, the lost-link timeout and the relay radio power are sent by a protocol 1.1 simulator, and ArcadiaOS uses what it is sent (`Config::with_constants`). Its own values for them are protocol 1.0's reference constants, used only when a `hello` carries none. No message carries a site's wear rates or its scan error. Wear and its growth are read from what the robots show (see [Health](#health-and-predictive-maintenance)); the nominal rates, from ArcadiaBench's `docs/simulator.md` for its catalog 1.0, are only the starting point before any robot has shown wear. The health model's coefficients (how much slip or current a unit of wear shows, how wear slows a robot) and the centimetre of scan error are still assumptions. The cold window starts deliberately wider than the reference simulator's. ArcadiaOS uses these numbers to rank options, and corrects energy and time estimates from what it measures. None is specific to a seed, a crew or a site.

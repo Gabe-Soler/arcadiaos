@@ -54,12 +54,19 @@ pub struct CapacityPlan {
     shares: BTreeMap<(usize, CapabilityName), f64>,
     /// Planned busy time per robot, s.
     pub loads_s: Vec<f64>,
-    /// Planned makespan of the remaining work, s.
+    /// Planned makespan of the remaining work, s: the busiest robot's load,
+    /// or the time the site needs to deliver the energy, whichever is longer.
     pub makespan_s: f64,
+    /// How long the site would take to deliver the energy the remaining
+    /// work needs, s: zero until [`CapacityPlan::bound_by_power`] is told
+    /// what the site can deliver.
+    pub power_s: f64,
     /// Planned energy per robot for its share, Wh.
     pub energy_wh: Vec<f64>,
     /// Workload size when solved.
     pub solved_size: f64,
+    /// Capabilities that had work when solved.
+    solved_caps: Vec<CapabilityName>,
     /// Robots available when solved.
     pub solved_available: Vec<bool>,
     /// Whether the linear program solved (otherwise shares are an even split).
@@ -207,6 +214,11 @@ impl CapacityPlan {
             loads_s: vec![0.0; n_robots],
             energy_wh: vec![0.0; n_robots],
             solved_size: workload_size(workload),
+            solved_caps: workload
+                .iter()
+                .filter(|(_, w)| w.steps > 0.0)
+                .map(|(&cap, _)| cap)
+                .collect(),
             solved_available: (0..n_robots).map(usable).collect(),
             ..Self::default()
         };
@@ -267,6 +279,24 @@ impl CapacityPlan {
         plan
     }
 
+    /// Hold the plan to what the site can deliver. Each robot's load already
+    /// counts its own time on a charger, but not that the crew shares the
+    /// stations' slots and a plant of `deliverable_w`: all the energy of the
+    /// remaining work has to come through that, however many robots wait
+    /// for it. The shares stay as solved: who does what best does not depend
+    /// on it, only how long the build takes and how much each robot's time
+    /// is worth.
+    pub fn bound_by_power(&mut self, deliverable_w: f64) {
+        let crew_s = self.loads_s.iter().copied().fold(0.0, f64::max);
+        let energy: f64 = self.energy_wh.iter().filter(|e| e.is_finite()).sum();
+        self.power_s = if deliverable_w > 0.0 && deliverable_w.is_finite() {
+            energy / deliverable_w * 3600.0
+        } else {
+            0.0
+        };
+        self.makespan_s = crew_s.max(self.power_s);
+    }
+
     /// Whether the set of working robots differs from the one this plan was
     /// solved for (and there was a plan): re-solving would be a replan.
     pub fn fleet_changed(&self, available: &[bool]) -> bool {
@@ -285,7 +315,15 @@ impl CapacityPlan {
             .shares
             .keys()
             .any(|(_, cap)| workload.get(cap).is_none_or(|w| w.steps <= 0.0));
-        drained || ended
+        // And when work appears that the plan knows nothing of: a
+        // capability that had none, or a workload grown past the one solved
+        // for. Rework found at the end of a build is such work, and a plan
+        // solved for an empty pad gives nobody the role to do it.
+        let appeared = workload
+            .iter()
+            .any(|(cap, w)| w.steps > 0.0 && !self.solved_caps.contains(cap));
+        let grown = size > 1.15 * self.solved_size;
+        drained || ended || appeared || grown
     }
 }
 
@@ -302,6 +340,66 @@ mod tests {
             travel_m_per_step: 1.0,
             passes,
         }
+    }
+
+    #[test]
+    fn work_that_appears_makes_the_plan_stale() {
+        let sinterer = |id: &str| robot(id, 0.1, vec![cap(Sinter, 4e-5, 37_000.0, None)]);
+        let reg = Registry::new(&scenario(vec![sinterer("cp-1"), sinterer("cp-2")]));
+        let cfg = Config::default();
+        let crew = [true, true];
+        // A plan solved for a finished pad: nobody has a role.
+        let done = CapacityPlan::solve(&Workload::new(), &reg, &crew, &cfg);
+        assert!(!done.has_roles(0, 0.01) && !done.has_roles(1, 0.01));
+        assert!(!done.stale(&Workload::new(), &crew));
+        // The recheck finds four cells to redo: that is work the plan knows
+        // nothing of, and solving again hands out the sintering.
+        let mut redo = Workload::new();
+        redo.insert(Sinter, work(4.0, 4.0, 1.0));
+        assert!(done.stale(&redo, &crew));
+        let plan = CapacityPlan::solve(&redo, &reg, &crew, &cfg);
+        assert!(plan.is_role(0, Sinter, 0.01) && plan.is_role(1, Sinter, 0.01));
+        assert!(!plan.stale(&redo, &crew));
+        // More of the same work, well past what was planned, does it too;
+        // a little more does not.
+        let mut more = Workload::new();
+        more.insert(Sinter, work(4.5, 4.5, 1.0));
+        assert!(!plan.stale(&more, &crew));
+        more.insert(Sinter, work(6.0, 6.0, 1.0));
+        assert!(plan.stale(&more, &crew));
+    }
+
+    #[test]
+    fn a_short_plant_sets_the_makespan_and_leaves_the_roles() {
+        // Two sinterers with 400 cells between them, at 37 kWh a cell.
+        let sinterer = |id: &str| robot(id, 0.1, vec![cap(Sinter, 4e-5, 37_000.0, None)]);
+        let reg = Registry::new(&scenario(vec![sinterer("cp-1"), sinterer("cp-2")]));
+        let mut w = Workload::new();
+        w.insert(Sinter, work(400.0, 400.0, 1.0));
+        let cfg = Config::default();
+        let mut plan = CapacityPlan::solve(&w, &reg, &[true, true], &cfg);
+        let crew_s = plan.makespan_s;
+        let energy: f64 = plan.energy_wh.iter().sum();
+        assert!(energy > 400.0 * 37_000.0);
+        assert_eq!(plan.power_s, 0.0);
+        let shares = (plan.share(0, Sinter), plan.share(1, Sinter));
+        assert!((shares.0 - 0.5).abs() < 1e-6 && (shares.1 - 0.5).abs() < 1e-6);
+        // A site that delivers more than the two can use changes nothing.
+        plan.bound_by_power(1e9);
+        assert_eq!(plan.makespan_s, crew_s);
+        assert!(plan.power_s > 0.0 && plan.power_s < crew_s);
+        // One that delivers a third of what they draw sets the pace: all
+        // the energy has to come through it. The robots are then busy a
+        // third of the time, and they keep their shares.
+        let draw_w = energy / (crew_s / 3600.0);
+        plan.bound_by_power(draw_w / 3.0);
+        assert!((plan.makespan_s - 3.0 * crew_s).abs() < 1e-6 * crew_s);
+        assert_eq!(plan.makespan_s, plan.power_s);
+        assert!((plan.utilization(0) - 1.0 / 3.0).abs() < 1e-6);
+        assert_eq!((plan.share(0, Sinter), plan.share(1, Sinter)), shares);
+        // An unknown plant bounds nothing.
+        plan.bound_by_power(0.0);
+        assert_eq!((plan.makespan_s, plan.power_s), (crew_s, 0.0));
     }
 
     #[test]

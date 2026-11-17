@@ -29,6 +29,9 @@ pub struct Config {
     pub rock_density_kg_m3: f64,
     /// Expected settlement from compaction, m (refined by verification scans).
     pub compact_settle_m: f64,
+    /// Standard deviation of a scanned elevation, m (interface assumption:
+    /// no message carries it).
+    pub scan_noise_m: f64,
 
     // ----- earthworks plan -----
     /// Cells lower than target minus this need fill before grading, m.
@@ -59,6 +62,29 @@ pub struct Config {
     pub verify_batch_cells: usize,
     /// A verified cell further than tolerance plus this from target is reworked, m.
     pub rework_margin_m: f64,
+    /// A compacted cell is sintered only if it is inside the tolerance by
+    /// this much, m: redoing it is cheap before sintering and dear after.
+    pub presinter_margin_m: f64,
+    /// A limit counts as met, or as broken, when the measured value is this
+    /// many standard errors clear of it; in between, the cell is scanned again.
+    pub measure_z: f64,
+    /// Scans of one cell after which its mean is taken as it stands.
+    pub measure_max_samples: u32,
+    /// At the end of a build whose pad looks finished and is not, a careful
+    /// crew scans a cell up to this many times before it redoes one on
+    /// suspicion. A scan of the pad takes minutes; a cell redone takes
+    /// hours.
+    pub recheck_max_samples: u32,
+    /// How many standard errors past a limit a cell's averaged height has
+    /// to be for a careful crew to redo it without scanning again.
+    pub recheck_z: f64,
+    /// Measured cells kept ready for the sinterers: with fewer waiting,
+    /// compacted cells are scanned at once and not in batches.
+    pub measure_ahead_cells: usize,
+    /// Compacted cells are measured before sintering only when the crew's
+    /// quickest sinterer takes at least this long over one cell, s: below
+    /// it, redoing a sintered cell costs less than the scans would.
+    pub careful_sinter_s: f64,
 
     // ----- energy -----
     /// Battery margin kept beyond the trip home, as a fraction of capacity.
@@ -91,8 +117,14 @@ pub struct Config {
     pub retry_backoff_s: f64,
     /// Decisions at one sim time before ArcadiaOS stops issuing and waits.
     pub max_same_time_decisions: u32,
-    /// Wake-up interval while waiting with nothing in flight, s.
+    /// Wake-up interval while waiting with nothing in flight, or with a
+    /// robot waiting to be recovered, s. It is also the shortest wait when
+    /// robots are merely idle.
     pub idle_wake_s: f64,
+    /// The longest ArcadiaOS leaves idle robots unlooked at while others
+    /// work, s. Until then it wakes when the first of them would need to
+    /// park and charge, or when something happens.
+    pub idle_wake_max_s: f64,
     /// Remaining unfinished pad cells at which the end game starts.
     pub endgame_cells: usize,
 
@@ -302,6 +334,7 @@ impl Default for Config {
             default_density_kg_m3: 1550.0,
             rock_density_kg_m3: 2800.0,
             compact_settle_m: 0.01,
+            scan_noise_m: 0.01,
 
             fill_trigger_m: 0.10,
             fill_aim_m: 0.05,
@@ -317,6 +350,13 @@ impl Default for Config {
             section_cells: 40,
             verify_batch_cells: 20,
             rework_margin_m: 0.0,
+            presinter_margin_m: 0.005,
+            measure_z: 2.0,
+            measure_max_samples: 16,
+            recheck_max_samples: 48,
+            recheck_z: 3.0,
+            measure_ahead_cells: 8,
+            careful_sinter_s: 900.0,
 
             energy_margin_frac: 0.025,
             energy_margin_min_wh: 25.0,
@@ -334,6 +374,7 @@ impl Default for Config {
             retry_backoff_s: 300.0,
             max_same_time_decisions: 50,
             idle_wake_s: 900.0,
+            idle_wake_max_s: 7200.0,
             endgame_cells: 8,
 
             tow_speed_factor: 0.5,
@@ -381,7 +422,7 @@ impl Default for Config {
             maint_break_ratio: 1.0,
             maint_urgent_ratio: 2.0,
             maint_min_benefit_s: 600.0,
-            maint_overhead_s: 900.0,
+            maint_overhead_s: 300.0,
             maint_horizon_h: 4.0,
 
             heater_idle_factor: 1.0,
