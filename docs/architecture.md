@@ -403,6 +403,31 @@ ArcadiaOS never issues a command that would complete instantly, such as a move t
 
 ## Results
 
+Two published sets, one for each of ArcadiaBench's catalogs. They are not comparable: a build on catalog 1.1 takes weeks, and on catalog 1.0 hours.
+
+### Catalog 1.1
+
+ArcadiaBench 1.1's default catalog makes the build take weeks: seven hours and 37 kWh to sinter a square metre, 4 cm of settlement, wear and faults that build up, a plant that the Large crew outgrows, and an Earth reachable in short passes. ArcadiaOS 1.0's rules timed out on it. ArcadiaBench 1.1 benchmarks ArcadiaOS 1.1 and its three baseline coordinators on every preset and variant, seeds 1–50, in release; its [`results/v1.1/RESULTS.md`](https://github.com/Gabe-Soler/arcadiabench/blob/v1.1.0/results/v1.1/RESULTS.md) has every scorecard. Headline (success rate × mean speed), against the greedy baseline:
+
+| Headline | Small | Medium | Large |
+|---|---|---|---|
+| ArcadiaOS, `nominal` | **0.764** (49.1 sols) | **0.764** (24.6) | **0.692** (16.3) |
+| greedy baseline, `nominal` | 0.690 (54.7) | 0.683 (27.7) | 0.627 (18.1) |
+| ArcadiaOS, `cascading_faults` | **0.722** | **0.726** | **0.664** |
+| greedy baseline, `cascading_faults` | 0.630 | 0.654 | 0.599 |
+| ArcadiaOS, `solar_only` | **0.761** | **0.708** | **0.496** |
+| greedy baseline, `solar_only` | 0.676 | 0.649 | 0.450 |
+
+- ArcadiaOS finished all 900 runs with no policy violation and no robot lost, and has the higher headline in all 18 scenarios, by 9 to 15%. Greedy finished 899.
+- It takes about 3,500 decisions a run, against greedy's 3,000.
+- On the nominal build it finishes the pad 11% faster than greedy, averaged over the presets. It asks Earth about once a run on Large, before it charges from the site bank's reserve; greedy never asks.
+- Suite resilience is 0.974, against greedy's 0.962.
+- On the fleet design track the crew it designs scores 0.600 over the six variants; greedy with the same crew scores 0.546 ([Crew design](#crew-design)).
+- The catalog does not tell everything apart: stress makes 1 run of 3,600 fail, the two-week conjunction costs under 1%, and the three baselines are within 5% of one another.
+- **Where the time goes.** Sintering 400 cells takes 14.8 MWh, 96% of all the energy the robots use. On Small and Medium the sinterers set the pace. On Large, and with solar power only, the plant does: the crew draws all it generates, so the remaining differences between coordinators there are in the energy spent on anything other than sintering.
+
+### Catalog 1.0
+
 ArcadiaBench 1.0 benchmarks ArcadiaOS 1.0 and its three baseline coordinators on every preset and variant, seeds 1–50, in release; its [`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/arcadiabench/blob/v1.0.0/results/v1.0/RESULTS.md) has every scorecard. Headline (success rate × mean speed), nominal variant:
 
 | Coordinator | Small | Medium | Large |
@@ -420,23 +445,6 @@ ArcadiaBench 1.0 benchmarks ArcadiaOS 1.0 and its three baseline coordinators on
 - Decisions take a fraction of a millisecond: whole Large runs average under 0.14 ms a decision, simulator included. Runs on the same seed are byte-identical.
 
 ArcadiaBench's [demo replays](https://github.com/Gabe-Soler/arcadiabench/blob/main/docs/demos.md) show ArcadiaOS through a nominal build, a dust storm, a conjunction blackout and cascading faults.
-
-### Catalog 1.1, before its results are published
-
-ArcadiaBench 1.1's default catalog makes the build take weeks: seven hours and 37 kWh to sinter a square metre, 4 cm of settlement, wear and faults that build up, a plant that the Large crew outgrows, and an Earth reachable in short passes. ArcadiaOS 1.0's rules timed out on it. These are development measurements of this version against ArcadiaBench's greedy baseline, seeds 1–50, on ArcadiaBench `main`; the published tables come with ArcadiaBench 1.1's results.
-
-| Headline | Small | Medium | Large |
-|---|---|---|---|
-| ArcadiaOS, `nominal` | **0.764** (49.1 sols) | **0.764** (24.6) | **0.692** (16.3) |
-| greedy baseline, `nominal` | 0.690 (54.7) | 0.683 (27.7) | 0.627 (18.1) |
-| ArcadiaOS, `cascading_faults` | **0.722** | **0.726** | **0.664** |
-| greedy baseline, `cascading_faults` | 0.630 | 0.654 | 0.599 |
-| ArcadiaOS, `solar_only` | **0.761** | **0.708** | **0.496** |
-| greedy baseline, `solar_only` | 0.676 | 0.649 | 0.450 |
-
-- ArcadiaOS finished all 900 runs with no policy violation and no robot lost, and has the higher headline in all 18 scenarios, by 9 to 15%. Greedy finished 899.
-- It takes about 3,500 decisions a run, against greedy's 3,000.
-- **Where the time goes.** Sintering 400 cells takes 14.8 MWh, 96% of all the energy the robots use. On Small and Medium the sinterers set the pace. On Large, and with solar power only, the plant does: the crew draws all it generates, so the remaining differences between coordinators there are in the energy spent on anything other than sintering.
 
 ## Crew design
 

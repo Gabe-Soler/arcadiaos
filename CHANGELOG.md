@@ -4,7 +4,9 @@ All notable changes to ArcadiaOS. Versions follow semver.
 
 ## [Unreleased]
 
-Version 1.1.0, in development. It speaks arcadia-protocol 1.1.0, which does not work with protocol 1.0: it needs ArcadiaBench 1.1 or later. It builds on both of ArcadiaBench's catalogs: 1.0, and the default 1.1, where a build takes weeks. On catalog 1.1, seeds 1–50, it finishes all 900 runs with no policy violation and no robot lost, 9 to 15% ahead of the greedy baseline in every scenario; these are development measurements until ArcadiaBench publishes its 1.1 results.
+## [1.1.0] - 2026-11-16
+
+It speaks arcadia-protocol 1.1.0, which does not work with protocol 1.0: it needs ArcadiaBench 1.1 or later. It builds on both of ArcadiaBench's catalogs: 1.0, and the default 1.1, where a build takes weeks. On catalog 1.1, seeds 1–50, it finishes all 900 runs with no policy violation and no robot lost, 9 to 15% ahead of the greedy baseline in every scenario ([ArcadiaBench's v1.1 results](https://github.com/Gabe-Soler/arcadiabench/blob/v1.1.0/results/v1.1/RESULTS.md)).
 
 ### Added
 
