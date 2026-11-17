@@ -2,6 +2,20 @@
 
 All notable changes to ArcadiaOS. Versions follow semver.
 
+## [Unreleased]
+
+Version 1.1.0, in development. It speaks arcadia-protocol 1.1.0, which does not work with protocol 1.0: it needs ArcadiaBench 1.1 or later. ArcadiaBench 1.1's harder default catalog is not supported yet; on its catalog 1.0 this version makes the same runs as 1.0.0.
+
+### Changed
+
+- **Protocol 1.1.0.** ArcadiaOS speaks arcadia-protocol 1.1.0.
+  - **Constants from the simulator.** `hello` now carries the constants of the simulator's world (`scenario.constants`), and ArcadiaOS uses them in place of the values it assumed: the grade window, compaction settlement, minimum work time, rock density, the repair, tow, service and cannibalizing numbers, the heater's threshold and draw, the relay radio power, the lost-link timeout and Earth's response time. Without them it assumes protocol 1.0's reference constants, as before.
+  - **Mobile chargers' tanks.** A charger's own reading of its tank (`tank_wh`) replaces ArcadiaOS's running estimate whenever the snapshot is current.
+  - **Pass windows.** The Earth link's new cause `between_passes` and the end of the window in progress (`window_end_t`) are taken in. Nothing acts on them yet.
+  - **Later minor versions.** Values this version does not know (a status, a surface, a reject reason, a fault severity, an uplink, an objective) are handled safely instead of being impossible: an unknown status is not commanded, an unknown surface is treated as unworked ground, and an unknown message is ignored.
+- **Cold nights.** When heaters will run is still forecast as a window of the sol, but a temperature seen on the wrong side of the simulator's threshold now moves the window. On ArcadiaBench the assumed window already holds, so nothing changes there.
+- **Integration tests.** They name ArcadiaBench's catalog 1.0, and CI runs them against ArcadiaBench's `main` at the commit that added catalogs and the fleet design track.
+
 ## [1.0.0] - 2026-11-04
 
 The first release: a coordinator that builds ArcadiaBench's landing pad with any crew, under faults, power limits, a delayed and intermittent Earth link, and Earth's authority policy.

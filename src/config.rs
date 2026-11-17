@@ -1,12 +1,19 @@
 //! Tunable assumptions and thresholds, in one place.
 //!
-//! Two kinds of numbers live here. *Interface assumptions* describe work
-//! semantics that the protocol does not carry in `hello` (for example how far
-//! grading can level a cell, how long a depot service takes, or how health
-//! telemetry relates to wear); they come from the interface semantics and the
-//! reference simulator's documentation and are deliberately conservative.
-//! *Policy knobs* tune how ArcadiaOS plans. Nothing here is specific to a
-//! seed, a crew or a site.
+//! Two kinds of numbers live here. *Interface assumptions* describe how the
+//! world works: how far grading can level a cell, how long a depot service
+//! takes, how health telemetry relates to wear. *Policy knobs* tune how
+//! ArcadiaOS plans. Nothing here is specific to a seed, a crew or a site.
+//!
+//! A simulator on protocol 1.1 sends many of the interface assumptions in
+//! `hello` as `scenario.constants`, and [`Config::with_constants`] then
+//! replaces the values here with what it sent. The values here are what
+//! ArcadiaOS assumes when none arrive (protocol 1.0's reference constants),
+//! and for what no message carries: they come from the interface semantics
+//! and the reference simulator's documentation and are deliberately
+//! conservative.
+
+use arcadia_protocol::Constants;
 
 /// Every assumption and tuning knob ArcadiaOS uses.
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +115,8 @@ pub struct Config {
     pub repair_units_per_wear: f64,
     /// Fraction of every component's wear a field repair removes.
     pub repair_wear_cut: f64,
+    /// Work to strip a donor and install its parts, units.
+    pub cannibalize_units: f64,
     /// Most of a repairer's battery one repair may use.
     pub repair_max_battery_frac: f64,
 
@@ -188,9 +197,13 @@ pub struct Config {
     // ----- nights and the site grid -----
     /// Heater draw on cold nights, as a multiple of idle power.
     pub heater_idle_factor: f64,
+    /// Robot heaters run while the air is colder than this, °C.
+    pub heater_threshold_c: f64,
     /// Cold window assumed to start at this sol phase …
     pub cold_from_phase: f64,
-    /// … and to end at this sol phase the next morning.
+    /// … and to end at this sol phase the next morning. Temperatures seen
+    /// on the wrong side of the threshold move both edges
+    /// ([`crate::power::PowerModel::observe`]).
     pub cold_to_phase: f64,
     /// A robot with no work left keeps enough charge to idle this long, s.
     pub park_horizon_s: f64,
@@ -234,6 +247,51 @@ pub struct Config {
     /// What a standing approval of a routine action is worth, for the
     /// level-3 rule, s.
     pub routine_benefit_s: f64,
+}
+
+impl Config {
+    /// This configuration with the simulator's own constants in place of
+    /// the assumed ones (`scenario.constants`, protocol 1.1). A value that is
+    /// not a finite number is not taken, and nor is a negative one where
+    /// only a size makes sense.
+    pub fn with_constants(mut self, c: &Constants) -> Self {
+        let size = |dst: &mut f64, v: f64| {
+            if v.is_finite() && v >= 0.0 {
+                *dst = v;
+            }
+        };
+        size(&mut self.grade_window_m, c.grade_window_m);
+        size(&mut self.compact_settle_m, c.compaction_settlement_m);
+        size(&mut self.min_work_s, c.min_work_duration_s);
+        if c.rock_density_kg_m3.is_finite() && c.rock_density_kg_m3 > 0.0 {
+            self.rock_density_kg_m3 = c.rock_density_kg_m3;
+        }
+        size(&mut self.repair_units_degraded, c.repair_work_degraded);
+        size(&mut self.repair_units_disabled, c.repair_work_disabled);
+        size(&mut self.repair_units_stuck, c.repair_work_stuck);
+        // A field repair removes a fraction of the wear, at a price per
+        // unit removed: the work per unit of wear the robot carries.
+        let per_wear = c.repair_work_per_wear_removed * c.repair_wear_removed_fraction;
+        size(&mut self.repair_units_per_wear, per_wear);
+        if (0.0..=1.0).contains(&c.repair_wear_removed_fraction) {
+            self.repair_wear_cut = c.repair_wear_removed_fraction;
+        }
+        size(&mut self.cannibalize_units, c.strip_work + c.install_work);
+        if c.tow_speed_factor.is_finite() && c.tow_speed_factor > 0.0 {
+            self.tow_speed_factor = c.tow_speed_factor;
+        }
+        size(&mut self.tow_energy_factor, c.tow_energy_factor);
+        size(&mut self.service_s, c.depot_service_s);
+        self.depot_capacity = c.depot_capacity.max(1);
+        if c.heater_threshold_c.is_finite() {
+            self.heater_threshold_c = c.heater_threshold_c;
+        }
+        size(&mut self.heater_idle_factor, c.heater_power_factor);
+        size(&mut self.relay_radio_w, c.relay_radio_w);
+        size(&mut self.lost_link_timeout_s, c.lost_link_timeout_s);
+        size(&mut self.earth_response_s, c.earth_response_mean_s);
+        self
+    }
 }
 
 impl Default for Config {
@@ -287,6 +345,7 @@ impl Default for Config {
             repair_units_stuck: 0.5,
             repair_units_per_wear: 0.15,
             repair_wear_cut: 0.5,
+            cannibalize_units: 1.5,
             repair_max_battery_frac: 0.8,
 
             health_alpha: 0.05,
@@ -326,6 +385,7 @@ impl Default for Config {
             maint_horizon_h: 4.0,
 
             heater_idle_factor: 1.0,
+            heater_threshold_c: -60.0,
             cold_from_phase: 0.9,
             cold_to_phase: 0.35,
             park_horizon_s: 43_200.0,
@@ -346,5 +406,97 @@ impl Default for Config {
             no_alternative_s: 88_775.0,
             routine_benefit_s: 14_400.0,
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// The constants ArcadiaBench sends on its catalog 1.1.
+    pub(crate) fn sent() -> Constants {
+        Constants {
+            grade_window_m: 0.15,
+            compaction_settlement_m: 0.04,
+            min_work_duration_s: 30.0,
+            rock_density_kg_m3: 3000.0,
+            repair_work_degraded: 0.25,
+            repair_work_disabled: 1.0,
+            repair_work_stuck: 0.5,
+            repair_work_per_wear_removed: 0.3,
+            repair_wear_removed_fraction: 0.5,
+            strip_work: 0.5,
+            install_work: 1.0,
+            tow_speed_factor: 0.5,
+            tow_energy_factor: 2.0,
+            depot_service_s: 7200.0,
+            depot_capacity: 1,
+            heater_threshold_c: -60.0,
+            heater_power_factor: 1.0,
+            relay_radio_w: 20.0,
+            lost_link_timeout_s: 1800.0,
+            earth_response_mean_s: 14_400.0,
+        }
+    }
+
+    #[test]
+    fn the_simulators_constants_replace_the_assumed_ones() {
+        let assumed = Config::default();
+        let cfg = assumed.clone().with_constants(&sent());
+        assert_eq!(cfg.compact_settle_m, 0.04);
+        assert_eq!(cfg.min_work_s, 30.0);
+        assert_eq!(cfg.rock_density_kg_m3, 3000.0);
+        assert_eq!(cfg.relay_radio_w, 20.0);
+        assert_eq!(cfg.earth_response_s, 14_400.0);
+        // What matches the assumption stays as it was, and so does every
+        // policy knob.
+        assert_eq!(cfg.repair_units_per_wear, assumed.repair_units_per_wear);
+        assert_eq!(cfg.cannibalize_units, assumed.cannibalize_units);
+        let knobs = Config {
+            compact_settle_m: assumed.compact_settle_m,
+            min_work_s: assumed.min_work_s,
+            rock_density_kg_m3: assumed.rock_density_kg_m3,
+            relay_radio_w: assumed.relay_radio_w,
+            earth_response_s: assumed.earth_response_s,
+            ..cfg
+        };
+        assert_eq!(knobs, assumed);
+        // Protocol 1.0's reference constants are the assumed values.
+        let v1_0 = Constants {
+            compaction_settlement_m: 0.01,
+            min_work_duration_s: 5.0,
+            rock_density_kg_m3: 2800.0,
+            relay_radio_w: 25.0,
+            earth_response_mean_s: 1200.0,
+            ..sent()
+        };
+        assert_eq!(assumed.clone().with_constants(&v1_0), assumed);
+    }
+
+    #[test]
+    fn nonsense_constants_are_not_taken() {
+        let assumed = Config::default();
+        let bad = Constants {
+            grade_window_m: f64::NAN,
+            compaction_settlement_m: -0.04,
+            rock_density_kg_m3: 0.0,
+            repair_wear_removed_fraction: 1.5,
+            tow_speed_factor: 0.0,
+            depot_capacity: 0,
+            heater_threshold_c: f64::INFINITY,
+            earth_response_mean_s: f64::NEG_INFINITY,
+            ..sent()
+        };
+        let cfg = assumed.clone().with_constants(&bad);
+        assert_eq!(cfg.grade_window_m, assumed.grade_window_m);
+        assert_eq!(cfg.compact_settle_m, assumed.compact_settle_m);
+        assert_eq!(cfg.rock_density_kg_m3, assumed.rock_density_kg_m3);
+        assert_eq!(cfg.repair_wear_cut, assumed.repair_wear_cut);
+        assert_eq!(cfg.tow_speed_factor, assumed.tow_speed_factor);
+        assert_eq!(cfg.depot_capacity, 1, "a depot takes at least one robot");
+        assert_eq!(cfg.heater_threshold_c, assumed.heater_threshold_c);
+        assert_eq!(cfg.earth_response_s, assumed.earth_response_s);
+        // The good values beside them are still taken.
+        assert_eq!(cfg.min_work_s, 30.0);
     }
 }

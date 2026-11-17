@@ -6,11 +6,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # ArcadiaBench revision the integration job runs against: pinned to the
-  # ArcadiaBench 1.0.0 release commit, which speaks arcadia-protocol 1.0.0
-  # like this coordinator. The integration tests run the `nominal` and
-  # `conjunction` variants.
-  BENCH_REF: f00874d72b59431b62f627639bd79d388d930a1b
+  # ArcadiaBench revision the integration job runs against: its `main` with
+  # scenario catalogs and the fleet design track merged (1.1.0, not yet
+  # released), which speaks arcadia-protocol 1.1.0 like this coordinator.
+  # The integration tests run the `nominal` and `conjunction` variants of
+  # catalog 1.0.
+  BENCH_REF: 8dc083517de90ebb16bc431919f69541b20f522d
 
 jobs:
   check:

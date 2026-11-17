@@ -265,6 +265,7 @@ impl MiniSim {
                     range_m: 1000.0,
                 },
                 policy,
+                constants: None,
             },
         };
         let bots: Vec<Bot> = s
@@ -485,6 +486,7 @@ impl MiniSim {
                     faults: vec![],
                     in_relay_coverage: true,
                     telemetry_t: self.t,
+                    tank_wh: None,
                 })
                 .collect(),
         }

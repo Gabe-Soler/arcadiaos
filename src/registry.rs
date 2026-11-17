@@ -465,6 +465,7 @@ pub(crate) mod tests {
                     default_fallback: Fallback::Abort,
                 },
             },
+            constants: None,
         }
     }
 

@@ -110,6 +110,7 @@ fn hello(robots: Vec<RobotSpec>, stations: Vec<ChargeStation>) -> Box<Hello> {
                     default_fallback: Fallback::Proceed,
                 },
             },
+            constants: None,
         },
     })
 }
@@ -131,6 +132,7 @@ fn state(id: &str, x: u32, y: u32) -> RobotState {
         faults: vec![],
         in_relay_coverage: true,
         telemetry_t: 0.0,
+        tank_wh: None,
     }
 }
 

@@ -63,6 +63,9 @@ pub struct CommsStatus {
     pub one_way_delay_s: f64,
     /// When the link is expected back, if it is down and the site knows.
     pub expected_restore_t: Option<f64>,
+    /// When the pass window in progress closes, if the link is up and
+    /// works in windows (protocol 1.1).
+    pub window_end_t: Option<f64>,
 }
 
 /// Everything ArcadiaOS believes about the world.
@@ -154,6 +157,7 @@ impl WorldModel {
                 cause,
                 one_way_delay_s,
                 expected_restore_t,
+                window_end_t,
             } => {
                 self.comms = Some(CommsStatus {
                     t: e.t,
@@ -161,6 +165,7 @@ impl WorldModel {
                     cause: *cause,
                     one_way_delay_s: *one_way_delay_s,
                     expected_restore_t: *expected_restore_t,
+                    window_end_t: *window_end_t,
                 });
             }
             _ => {}
@@ -223,12 +228,49 @@ mod tests {
             cause: CommsCause::Outage,
             one_way_delay_s: 700.0,
             expected_restore_t: None,
+            window_end_t: None,
         }));
         assert_eq!(
             w.weather.as_ref().unwrap().condition,
             WeatherCondition::DustStorm
         );
         assert_eq!(w.comms.as_ref().unwrap().link, Link::Down);
+        // A link that works in pass windows (protocol 1.1): up until the
+        // window closes, then down between passes until the next one.
+        w.observe(&event(EventKind::Comms {
+            link: Link::Up,
+            cause: CommsCause::Nominal,
+            one_way_delay_s: 700.0,
+            expected_restore_t: None,
+            window_end_t: Some(900.0),
+        }));
+        let up = w.comms.clone().unwrap();
+        assert!(w.link_up());
+        assert_eq!(
+            (up.window_end_t, up.expected_restore_t),
+            (Some(900.0), None)
+        );
+        w.observe(&event(EventKind::Comms {
+            link: Link::Down,
+            cause: CommsCause::BetweenPasses,
+            one_way_delay_s: 700.0,
+            expected_restore_t: Some(4000.0),
+            window_end_t: None,
+        }));
+        let down = w.comms.clone().unwrap();
+        assert!(!w.link_up());
+        assert_eq!(down.cause, CommsCause::BetweenPasses);
+        assert_eq!(
+            (down.window_end_t, down.expected_restore_t),
+            (None, Some(4000.0))
+        );
+        w.observe(&event(EventKind::Comms {
+            link: Link::Down,
+            cause: CommsCause::Outage,
+            one_way_delay_s: 700.0,
+            expected_restore_t: None,
+            window_end_t: None,
+        }));
 
         // A full bank delivers everything; an empty one under heavy demand throttles.
         let power = |storage_wh: f64, demand_w: f64| {
