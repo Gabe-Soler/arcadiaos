@@ -28,6 +28,7 @@ pub mod capacity;
 pub mod config;
 pub mod coordinator;
 pub mod coverage;
+pub mod design;
 pub mod diag;
 pub mod energy;
 pub mod executor;
