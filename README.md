@@ -52,6 +52,8 @@ cargo build --release
 
 Each run prints a one-line summary, and `bench` prints its scorecard. ArcadiaBench's README covers every preset, variant and command, its replay viewer opens any saved log, and its `scripts/results.sh` reproduces the full benchmark results with this binary (it looks for it at `../arcadiaos/target/release/arcadiaos`, or wherever `ARCADIAOS` says).
 
+As a container: `docker build -t arcadiaos .`, then give ArcadiaBench `docker run --rm -i --network none --read-only arcadiaos` as the coordinator command. That is how ArcadiaBench's [leaderboard](https://gabe-soler.github.io/arcadiabench/#leaderboard) builds and runs it.
+
 ArcadiaOS writes nothing to stderr by default. Set `ARCADIAOS_LOG=info` for plan summaries, the capacity plan, charging, faults, recoveries and maintenance (with each robot's estimated wear at the end), or `ARCADIAOS_LOG=debug` to see every command as well.
 
 ## Design a crew

@@ -4,6 +4,10 @@ All notable changes to ArcadiaOS. Versions follow semver.
 
 ## [Unreleased]
 
+### Added
+
+- **A Dockerfile.** ArcadiaOS builds into an image whose entrypoint is the coordinator, which is how ArcadiaBench's leaderboard builds and runs an entry. It needs no network, no writable files and no privileges at run time. CI builds it and checks that a run in the container is byte for byte the run of the binary.
+
 ## [1.1.0] - 2026-11-16
 
 It speaks arcadia-protocol 1.1.0, which does not work with protocol 1.0: it needs ArcadiaBench 1.1 or later. It builds on both of ArcadiaBench's catalogs: 1.0, and the default 1.1, where a build takes weeks. On catalog 1.1, seeds 1–50, it finishes all 900 runs with no policy violation and no robot lost, 9 to 15% ahead of the greedy baseline in every scenario ([ArcadiaBench's v1.1 results](https://github.com/Gabe-Soler/arcadiabench/blob/v1.1.0/results/v1.1/RESULTS.md)).

@@ -1,0 +1,8 @@
+# Only the sources go into the image's build.
+/target
+/.git
+/.github
+/dev-docs
+/runs
+*.jsonl
+*.jsonl.gz
