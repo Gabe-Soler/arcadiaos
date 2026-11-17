@@ -4,7 +4,7 @@ ArcadiaOS: an operating system for robot crews building on Mars.
 
 ArcadiaOS decides which robot does what, when, and with how much power, while Earth supervises across a 4–24 minute delay and multi-week blackouts. It is measured on [ArcadiaBench](https://github.com/Gabe-Soler/arcadiabench), and it talks to the world only through [arcadia-protocol](https://github.com/Gabe-Soler/arcadia-protocol). That means the same coordinator can drive the simulator now and real hardware later.
 
-**Version 1.1.0, in development on `main`**, speaking arcadia-protocol 1.1.0, so it runs under ArcadiaBench 1.1 and later. The latest release is 1.0.0 (tag `v1.0.0`), which speaks protocol 1.0.0 and runs under ArcadiaBench 1.0; the two protocol versions do not work together. ArcadiaOS builds the landing pad of every scenario in both of ArcadiaBench's catalogs, with any of the benchmark's crews: catalog 1.0, where a build takes hours, and the default catalog 1.1, where it takes weeks. It has the best headline score in all 18 scenarios of catalog 1.0, and is ahead of the greedy baseline in all 18 of catalog 1.1 in development measurements ([results](#results)).
+**Version 1.1.0** (tag `v1.1.0`), speaking arcadia-protocol 1.1.0, so it runs under ArcadiaBench 1.1 and later. Release 1.0.0 (tag `v1.0.0`) speaks protocol 1.0.0 and runs under ArcadiaBench 1.0; the two protocol versions do not work together. ArcadiaOS builds the landing pad of every scenario in both of ArcadiaBench's catalogs, with any of the benchmark's crews: catalog 1.0, where a build takes hours, and the default catalog 1.1, where it takes weeks. It has the best headline score in all 18 scenarios of each ([results](#results)).
 
 ## What it does
 
@@ -70,26 +70,28 @@ ArcadiaBench's fleet design track lets a coordinator bring its own crew: a count
 ../arcadiabench/target/release/arcadiabench suite --crew crew.json --seeds 1-10 -- ./target/release/arcadiaos
 ```
 
-It plans the pad for every crew within the limits with the model ArcadiaOS builds by: the capacity plan, held to the energy the plant can deliver, then charged for what each robot's absence would cost. On catalog 1.1 it sends 2 scouts, 1 excavator, 1 hauler and 10 compactor-sinterers (9.9 t) and expects 16.2 sols; ArcadiaOS builds with them in 16.1 on the nominal variant. Over all six variants and seeds 1–10 that crew's headline is 0.603, against 0.409 for the Medium preset's crew and 0.526 for the Large preset's cut down to fit. [docs/architecture.md](docs/architecture.md#crew-design) has the model.
+It plans the pad for every crew within the limits with the model ArcadiaOS builds by: the capacity plan, held to the energy the plant can deliver, then charged for what each robot's absence would cost. On catalog 1.1 it sends 2 scouts, 1 excavator, 1 hauler and 10 compactor-sinterers (9.9 t) and expects 16.2 sols; ArcadiaOS builds with them in 16.1 on the nominal variant. Over all six variants and seeds 1–10 that crew's headline is 0.603, against 0.409 for the Medium preset's crew and 0.526 for the Large preset's cut down to fit; in the published results, over seeds 1–50, it is 0.600. [docs/architecture.md](docs/architecture.md#crew-design) has the model.
 
 ## Results
 
-These are ArcadiaOS 1.0.0's results on ArcadiaBench 1.0 ([`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/arcadiabench/blob/v1.0.0/results/v1.0/RESULTS.md)), every preset and variant over seeds 1–50, ArcadiaOS completes all 900 of its runs, with no policy violation and no robot lost, and has the best headline (success rate × speed) in all 18 scenarios, 10–21% above the greedy baseline's:
+**Catalog 1.1**: ArcadiaOS 1.1.0 on ArcadiaBench 1.1 ([`results/v1.1/RESULTS.md`](https://github.com/Gabe-Soler/arcadiabench/blob/v1.1.0/results/v1.1/RESULTS.md)), every preset and variant over seeds 1–50. ArcadiaOS completes all 900 of its runs, with no policy violation and no robot lost, and has the best headline (success rate × speed) in all 18 scenarios, 9–15% above the greedy baseline's:
 
-| Nominal headline | Small (4 robots) | Medium (10) | Large (20) |
+| Nominal headline, catalog 1.1 | Small (6 robots) | Medium (12) | Large (20) |
 |---|---|---|---|
-| ArcadiaOS | **0.559** | **0.753** | **0.710** |
-| greedy baseline | 0.501 | 0.681 | 0.585 |
-| random baseline | 0.499 | 0.677 | 0.587 |
-| first-come-first-served baseline | 0.385 | 0.419 | 0.362 |
+| ArcadiaOS | **0.764** | **0.764** | **0.692** |
+| greedy baseline | 0.690 | 0.683 | 0.627 |
+| random baseline | 0.673 | 0.678 | 0.628 |
+| first-come-first-served baseline | 0.660 | 0.659 | 0.606 |
 
-- On the nominal build it finishes the pad 15% faster than greedy, averaged over the presets, and neither needs Earth there. Across the whole catalog it asked Earth twice in 900 runs, both to cannibalize a robot in Large `cascading_faults`.
-- Its suite resilience is 0.975, against greedy's 0.967.
+- On the nominal build it finishes the pad 11% faster than greedy, averaged over the presets. It asks Earth about once a run on Large, before it charges from the site bank's reserve; greedy never asks.
+- Its suite resilience is 0.974, against greedy's 0.962.
+- On the fleet design track the crew it designs scores 0.600 over the six variants; the greedy baseline with the same crew scores 0.546.
+- The results also say what catalog 1.1 does not tell apart: stress makes almost no run fail, the two-week conjunction costs under 1%, and the three baselines are within 5% of one another.
 - Decisions take a fraction of a millisecond, and runs on the same seed are byte-identical.
 
-ArcadiaBench's [demo replays](https://github.com/Gabe-Soler/arcadiabench/blob/main/docs/demos.md) show ArcadiaOS through a nominal build, a dust storm, a conjunction blackout and cascading faults. [docs/architecture.md](docs/architecture.md#results) discusses where the time goes.
+**Catalog 1.0**: ArcadiaOS 1.0.0 on ArcadiaBench 1.0 ([`results/v1.0/RESULTS.md`](https://github.com/Gabe-Soler/arcadiabench/blob/v1.0.0/results/v1.0/RESULTS.md)), where a build takes hours. It completes all 900 runs and has the best headline in all 18 scenarios, 10–21% above greedy's (nominal: 0.559, 0.753 and 0.710 against 0.501, 0.681 and 0.585), finishing the pad 15% faster than greedy on the nominal build. The two sets are not comparable.
 
-**Catalog 1.1**, in development measurements over seeds 1–50 against ArcadiaBench `main`: ArcadiaOS finishes all 900 runs with no policy violation and no robot lost, and its headline is 9 to 15% above the greedy baseline's in all 18 scenarios (nominal: 0.764, 0.764 and 0.692 against 0.690, 0.683 and 0.627). ArcadiaOS 1.0's rules timed out there. The published tables come with ArcadiaBench 1.1's results; [docs/architecture.md](docs/architecture.md#catalog-11-before-its-results-are-published) has more.
+ArcadiaBench's [demo replays](https://github.com/Gabe-Soler/arcadiabench/blob/main/docs/demos.md) show ArcadiaOS through a nominal build, a dust storm, a conjunction blackout, cascading faults, and a build with a crew of its own design. [docs/architecture.md](docs/architecture.md#results) discusses where the time goes.
 
 ## Develop
 
