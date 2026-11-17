@@ -53,3 +53,12 @@ jobs:
         run: cargo build --release
       - name: Run ArcadiaOS under ArcadiaBench
         run: ARCADIABENCH="$GITHUB_WORKSPACE/bench/target/release/arcadiabench" cargo test --release --test bench
+      - name: The image gives the same run as the binary
+        run: |
+          # As ArcadiaBench's leaderboard runs an entry: built by the
+          # Dockerfile's own compiler, with no network and nothing writable.
+          docker build -q -t arcadiaos .
+          B=bench/target/release/arcadiabench
+          $B run --seed 1 --log direct.jsonl -- target/release/arcadiaos
+          $B run --seed 1 --log boxed.jsonl -- docker run --rm -i --network none --read-only --cap-drop ALL --user 65534:65534 arcadiaos
+          cmp direct.jsonl boxed.jsonl
